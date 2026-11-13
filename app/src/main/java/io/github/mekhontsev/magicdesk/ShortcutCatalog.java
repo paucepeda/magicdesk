@@ -6,6 +6,8 @@ final class ShortcutCatalog {
                 R.string.shortcut_maximize_action),
         new Entry(R.string.shortcut_restore,
                 R.string.shortcut_restore_action),
+        new Entry(R.string.shortcut_portrait,
+                R.string.shortcut_portrait_action),
         new Entry(R.string.shortcut_snap_left,
                 R.string.shortcut_snap_left_action),
         new Entry(R.string.shortcut_snap_right,

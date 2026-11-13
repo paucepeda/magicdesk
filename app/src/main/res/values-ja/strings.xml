@@ -728,6 +728,8 @@
     <string name="shortcut_maximize_action">全画面で開く</string>
     <string name="shortcut_restore">Win + Down</string>
     <string name="shortcut_restore_action">復元してから最小化</string>
+    <string name="shortcut_portrait">Win + Shift + P</string>
+    <string name="shortcut_portrait_action">アクティブウィンドウを端末の縦向き比率に合わせる</string>
     <string name="shortcut_snap_left">Win + Left</string>
     <string name="shortcut_snap_left_action">ウィンドウを左に配置</string>
     <string name="shortcut_snap_right">Win + Right</string>

@@ -48,6 +48,10 @@ final class DesktopShortcutActions {
                 DesktopOperations.manageActiveWindow(
                         DesktopWindowAction.RESTORE);
                 break;
+            case FIT_PORTRAIT:
+                DesktopOperations.manageActiveWindow(
+                        DesktopWindowAction.FIT_PORTRAIT);
+                break;
             case SNAP_LEFT:
                 DesktopOperations.manageActiveWindow(
                         DesktopWindowAction.SNAP_LEFT);

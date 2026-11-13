@@ -758,6 +758,8 @@
     <string name="shortcut_maximize_action">Открыть на весь экран</string>
     <string name="shortcut_restore">Win + Down</string>
     <string name="shortcut_restore_action">Восстановить, затем свернуть</string>
+    <string name="shortcut_portrait">Win + Shift + P</string>
+    <string name="shortcut_portrait_action">Подогнать активное окно под портретный формат телефона</string>
     <string name="shortcut_snap_left">Win + Left</string>
     <string name="shortcut_snap_left_action">Окно в левую половину</string>
     <string name="shortcut_snap_right">Win + Right</string>

@@ -85,6 +85,7 @@ public final class DesktopWindowTransitionControllerTest {
         assertTrue(DesktopWindowAction.SNAP_TOP_RIGHT.supportsFullscreenTask());
         assertTrue(DesktopWindowAction.SNAP_BOTTOM_LEFT.supportsFullscreenTask());
         assertTrue(DesktopWindowAction.SNAP_BOTTOM_RIGHT.supportsFullscreenTask());
+        assertTrue(DesktopWindowAction.FIT_PORTRAIT.supportsFullscreenTask());
     }
 
     @Test

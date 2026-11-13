@@ -54,6 +54,53 @@ final class NativeWindowBoundsController {
         return snappedBounds(getTaskbarMaximizedBounds(), left, row);
     }
 
+    Rect getPhonePortraitBounds() {
+        final DisplayManager displayManager =
+                mApplicationContext.getSystemService(DisplayManager.class);
+        final Display phoneDisplay = displayManager == null
+                ? null : displayManager.getDisplay(Display.DEFAULT_DISPLAY);
+        if (phoneDisplay == null) {
+            return null;
+        }
+        final Point size = new Point();
+        getRealSize(phoneDisplay, size);
+        return phonePortraitBounds(
+                getTaskbarMaximizedBounds(), size.x, size.y);
+    }
+
+    static Rect phonePortraitBounds(
+            final Rect workArea,
+            final int phoneDisplayWidth,
+            final int phoneDisplayHeight) {
+        if (workArea == null || workArea.isEmpty()
+                || phoneDisplayWidth <= 0 || phoneDisplayHeight <= 0) {
+            return null;
+        }
+        final int aspectWidth = Math.min(phoneDisplayWidth, phoneDisplayHeight);
+        final int aspectHeight = Math.max(phoneDisplayWidth, phoneDisplayHeight);
+        final long widthAtFullHeightNumerator =
+                (long) workArea.height() * aspectWidth;
+        final int widthAtFullHeight = roundDivide(
+                widthAtFullHeightNumerator, aspectHeight);
+        final int width;
+        final int height;
+        if (widthAtFullHeight <= workArea.width()) {
+            width = Math.max(1, widthAtFullHeight);
+            height = workArea.height();
+        } else {
+            width = workArea.width();
+            height = Math.max(1, Math.min(workArea.height(), roundDivide(
+                    (long) width * aspectHeight, aspectWidth)));
+        }
+        final int left = workArea.left + (workArea.width() - width) / 2;
+        final int top = workArea.top + (workArea.height() - height) / 2;
+        return new Rect(left, top, left + width, top + height);
+    }
+
+    private static int roundDivide(final long numerator, final int denominator) {
+        return (int) ((numerator + denominator / 2L) / denominator);
+    }
+
     static Rect snappedBounds(final Rect workArea, final boolean left, final int row) {
         if (row < -1 || row > 1) throw new IllegalArgumentException("invalid snap row");
         final int middleX = workArea.left + (workArea.right - workArea.left) / 2;

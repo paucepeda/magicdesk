@@ -439,7 +439,8 @@ final class AutomationCommandCatalog {
                                         .put("taskId", integerProperty(
                                                 "Android task id."))
                                         .put("arrangement", enumProperty(
-                                                "Target arrangement.",
+                                                "Target arrangement; portrait fits the phone's live aspect into the work area.",
+                                                "portrait",
                                                 "left", "right",
                                                 "top_left", "top_right",
                                                 "bottom_left", "bottom_right",

@@ -12,7 +12,8 @@ enum DesktopWindowAction {
     SNAP_BOTTOM_LEFT(8, true),
     SNAP_BOTTOM_RIGHT(9, true),
     MAXIMIZE(10, true),
-    UNMAXIMIZE(11, false);
+    UNMAXIMIZE(11, false),
+    FIT_PORTRAIT(12, true);
 
     private final int mDiagnosticId;
     private final boolean mSupportsFullscreen;

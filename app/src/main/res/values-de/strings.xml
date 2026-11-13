@@ -738,6 +738,8 @@
     <string name="shortcut_maximize_action">Im Vollbild öffnen</string>
     <string name="shortcut_restore">Win + Down</string>
     <string name="shortcut_restore_action">Wiederherstellen, dann minimieren</string>
+    <string name="shortcut_portrait">Win + Shift + P</string>
+    <string name="shortcut_portrait_action">Aktives Fenster an das Hochformat des Telefons anpassen</string>
     <string name="shortcut_snap_left">Win + Left</string>
     <string name="shortcut_snap_left_action">Fenster links anordnen</string>
     <string name="shortcut_snap_right">Win + Right</string>

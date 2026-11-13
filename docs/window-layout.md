@@ -43,6 +43,13 @@ live target selection and ownership checks remain in `DesktopTaskController`.
 existing geometry and fullscreen owners. A layout plan cannot issue these
 actions or acquire their authority implicitly.
 
+`FIT_PORTRAIT` (`Win+Shift+P`) arranges only the focused managed task in the
+largest centered rectangle that fits the active desktop work area, using the
+live built-in display's portrait aspect ratio. It uses the ordinary bounds
+transition and restore history; `Win+Down` restores the previous geometry. It
+does not change density, display mode, rotation, or other tasks. Android and an
+app may constrain the requested rectangle, so verify observed bounds.
+
 The complete plan is validated before acquiring geometry ownership. Missing,
 foreign and non-freeform targets reject the plan. `TaskWindowingCommand`
 revalidates live display and mode at the shell boundary. One placement uses

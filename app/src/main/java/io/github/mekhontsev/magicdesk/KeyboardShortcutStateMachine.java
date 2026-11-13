@@ -28,6 +28,7 @@ final class KeyboardShortcutStateMachine {
         SNAP_TOP_RIGHT,
         SNAP_BOTTOM_LEFT,
         SNAP_BOTTOM_RIGHT,
+        FIT_PORTRAIT,
         SHOW_DESKTOP,
         DISPLAY_FORWARD,
         DISPLAY_REVERSE,
@@ -175,7 +176,7 @@ final class KeyboardShortcutStateMachine {
             return shift ? Action.SCREEN_RECORDING : Action.SCREENSHOT;
         }
         if (shift) {
-            return Action.NONE;
+            return key == KeyEvent.KEYCODE_P ? Action.FIT_PORTRAIT : Action.NONE;
         }
         return switch (key) {
             case KeyEvent.KEYCODE_DEL -> Action.BACK;

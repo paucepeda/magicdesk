@@ -28,5 +28,6 @@ public final class DesktopWindowActionTest {
         assertEquals(9, DesktopWindowAction.SNAP_BOTTOM_RIGHT.diagnosticId());
         assertEquals(10, DesktopWindowAction.MAXIMIZE.diagnosticId());
         assertEquals(11, DesktopWindowAction.UNMAXIMIZE.diagnosticId());
+        assertEquals(12, DesktopWindowAction.FIT_PORTRAIT.diagnosticId());
     }
 }

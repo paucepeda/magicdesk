@@ -161,6 +161,17 @@ final class DesktopWindowTransitionController {
             case MAXIMIZE:
                 arrange(task, mNativeWindowBounds.getTaskbarMaximizedBounds());
                 break;
+            case FIT_PORTRAIT: {
+                final Rect portraitBounds =
+                        mNativeWindowBounds.getPhonePortraitBounds();
+                if (portraitBounds == null || portraitBounds.isEmpty()) {
+                    Log.w(TAG, "phone portrait bounds unavailable task="
+                            + task.taskId);
+                    break;
+                }
+                arrange(task, portraitBounds);
+                break;
+            }
             case UNMAXIMIZE:
                 if (task.isFreeform()) {
                     mNativeWindowBounds.rememberRestoreBounds(task);

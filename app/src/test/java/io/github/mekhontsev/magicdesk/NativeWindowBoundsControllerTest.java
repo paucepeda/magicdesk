@@ -2,6 +2,7 @@ package io.github.mekhontsev.magicdesk;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 import android.graphics.Rect;
 
@@ -94,6 +95,47 @@ public final class NativeWindowBoundsControllerTest {
                         rect(100, 0, 1000, 1060),
                         DISPLAY,
                         WORK_AREA));
+    }
+
+    @Test
+    public void phonePortraitFitUsesLiveAspectAndCentersInWideWorkArea() {
+        final Rect area = rect(10, 20, 2010, 920);
+        final Rect fitted = NativeWindowBoundsController.phonePortraitBounds(
+                area, 2, 5);
+
+        assertTrue(area.left <= fitted.left && fitted.right <= area.right);
+        assertTrue(area.top <= fitted.top && fitted.bottom <= area.bottom);
+        assertEquals(fitted.height() * 2 / 5, fitted.width());
+        assertEquals(area.left + (area.width() - fitted.width()) / 2,
+                fitted.left);
+        assertEquals(area.top, fitted.top);
+    }
+
+    @Test
+    public void phonePortraitFitUsesWidthWhenWorkAreaIsTooNarrow() {
+        final Rect area = rect(40, 30, 340, 1030);
+        final Rect fitted = NativeWindowBoundsController.phonePortraitBounds(
+                area, 2, 5);
+
+        assertEquals(area.width(), fitted.width());
+        assertEquals(fitted.width() * 5 / 2, fitted.height());
+        assertEquals(area.left, fitted.left);
+        assertEquals(area.top + (area.height() - fitted.height()) / 2,
+                fitted.top);
+        assertTrue(area.left <= fitted.left && fitted.right <= area.right);
+        assertTrue(area.top <= fitted.top && fitted.bottom <= area.bottom);
+    }
+
+    @Test
+    public void phonePortraitFitIsRotationIndependentAndFailsClosedWithoutGeometry() {
+        final Rect area = rect(10, 20, 2010, 920);
+        assertEquals(
+                NativeWindowBoundsController.phonePortraitBounds(area, 2, 5),
+                NativeWindowBoundsController.phonePortraitBounds(area, 5, 2));
+        assertNull(NativeWindowBoundsController.phonePortraitBounds(null, 2, 5));
+        assertNull(NativeWindowBoundsController.phonePortraitBounds(
+                rect(0, 0, 0, 100), 2, 5));
+        assertNull(NativeWindowBoundsController.phonePortraitBounds(area, 0, 5));
     }
 
     private static void assertBounds(

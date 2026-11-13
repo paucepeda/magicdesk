@@ -748,6 +748,8 @@
     <string name="shortcut_maximize_action">Abrir em tela cheia</string>
     <string name="shortcut_restore">Win + Down</string>
     <string name="shortcut_restore_action">Restaurar, depois minimizar</string>
+    <string name="shortcut_portrait">Win + Shift + P</string>
+    <string name="shortcut_portrait_action">Ajustar a janela ativa à proporção vertical do telefone</string>
     <string name="shortcut_snap_left">Win + Left</string>
     <string name="shortcut_snap_left_action">Ajustar janela à esquerda</string>
     <string name="shortcut_snap_right">Win + Right</string>

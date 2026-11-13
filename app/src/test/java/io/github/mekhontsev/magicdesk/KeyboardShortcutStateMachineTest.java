@@ -163,6 +163,22 @@ public final class KeyboardShortcutStateMachineTest {
         assertFalse(s.accept(KeyEvent.KEYCODE_DPAD_DOWN, true, 0, false, false, false, false).consumed);
     }
 
+    @Test public void metaShiftPRequestsPortraitFitOnlyOnDesktop() {
+        final KeyboardShortcutStateMachine desktop = new KeyboardShortcutStateMachine();
+        final var fit = desktop.accept(KeyEvent.KEYCODE_P, true, 0,
+                false, false, true, true, true);
+        assertTrue(fit.consumed);
+        assertEquals(FIT_PORTRAIT, fit.action);
+        assertTrue(desktop.accept(KeyEvent.KEYCODE_P, false, 0,
+                false, false, true, true, true).consumed);
+
+        final KeyboardShortcutStateMachine ordinary = new KeyboardShortcutStateMachine();
+        assertEquals(NONE, ordinary.accept(KeyEvent.KEYCODE_P, true, 0,
+                false, false, true, true, false).action);
+        assertEquals(NONE, new KeyboardShortcutStateMachine().accept(
+                KeyEvent.KEYCODE_P, true, 0, true, false, true, true, true).action);
+    }
+
     @Test public void ordinaryTextAndApplicationShortcutsPassUnchanged() {
         final KeyboardShortcutStateMachine s = new KeyboardShortcutStateMachine();
         for (int repeat = 0; repeat < 3; repeat++) {

@@ -737,6 +737,8 @@
     <string name="shortcut_maximize_action">Open fullscreen</string>
     <string name="shortcut_restore">Win + Down</string>
     <string name="shortcut_restore_action">Restore, then minimize</string>
+    <string name="shortcut_portrait">Win + Shift + P</string>
+    <string name="shortcut_portrait_action">Fit active window to phone portrait ratio</string>
     <string name="shortcut_snap_left">Win + Left</string>
     <string name="shortcut_snap_left_action">Snap window left</string>
     <string name="shortcut_snap_right">Win + Right</string>

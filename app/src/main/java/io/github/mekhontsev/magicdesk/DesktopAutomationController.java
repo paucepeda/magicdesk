@@ -907,6 +907,9 @@ final class DesktopAutomationController {
                 .toLowerCase(Locale.ROOT);
         final DesktopWindowAction shortcut;
         switch (arrangement) {
+            case "portrait":
+                shortcut = DesktopWindowAction.FIT_PORTRAIT;
+                break;
             case "left":
                 shortcut = DesktopWindowAction.SNAP_LEFT;
                 break;
@@ -933,8 +936,9 @@ final class DesktopAutomationController {
                 break;
             default:
                 throw new IllegalArgumentException(
-                        "arrangement must be left, right, top_left, top_right, "
-                                + "bottom_left, bottom_right, maximize, or restore");
+                        "arrangement must be portrait, left, right, top_left, "
+                                + "top_right, bottom_left, bottom_right, maximize, "
+                                + "or restore");
         }
         if (!MagicDeskRuntime.arrangeTask(task.displayId, taskId, shortcut)) {
             return DesktopAutomationResult.failure(

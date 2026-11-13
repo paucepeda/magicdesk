@@ -593,7 +593,7 @@ public final class AutomationCommandCatalogTest {
         final JSONArray arrangements = managed.getJSONObject("inputSchema")
                 .getJSONObject("properties").getJSONObject("arrangement")
                 .getJSONArray("enum");
-        for (final String arrangement : new String[]{"left", "right", "top_left",
+        for (final String arrangement : new String[]{"portrait", "left", "right", "top_left",
                 "top_right", "bottom_left", "bottom_right", "maximize", "restore"}) {
             assertTrue(contains(arrangements, arrangement));
         }

@@ -728,6 +728,8 @@
     <string name="shortcut_maximize_action">全屏打开</string>
     <string name="shortcut_restore">Win + Down</string>
     <string name="shortcut_restore_action">还原，然后最小化</string>
+    <string name="shortcut_portrait">Win + Shift + P</string>
+    <string name="shortcut_portrait_action">将当前窗口调整为手机竖屏比例</string>
     <string name="shortcut_snap_left">Win + Left</string>
     <string name="shortcut_snap_left_action">将窗口贴靠左侧</string>
     <string name="shortcut_snap_right">Win + Right</string>
