@@ -232,12 +232,15 @@ static void shm_slots(int denied) {
                 BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_fstat,0,1),
                 BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|ENOMSG),
                 BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_mmap,0,1),
+                BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|EACCES),
+                BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_shmat,0,1),
                 BPF_STMT(BPF_RET|BPF_K,denied ? SECCOMP_RET_ERRNO|EACCES : SECCOMP_RET_ALLOW),
                 BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)
             };
             struct sock_fprog program={sizeof(code)/sizeof(*code),code};
             assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
             assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
+            assert(mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0)==MAP_FAILED && errno==EACCES);
             struct rlimit limit; assert(!getrlimit(RLIMIT_NOFILE,&limit));
             limit.rlim_cur=64; assert(!setrlimit(RLIMIT_NOFILE,&limit));
             int last=-1, fd;
@@ -277,22 +280,30 @@ static int shared_wait(void *data) {
     assert(!semop(id,&op,1));
     return 0;
 }
-struct shm_attempt { int id, mode, protected; void *address; };
+struct shm_attempt { int id, mode, protected; };
 static int shm_attempt(void *data) {
     struct shm_attempt *a=data;
     if (a->protected) assert(!prctl(PR_SET_DUMPABLE,0));
+    unsigned denied_call=a->mode==0 ? SYS_mmap : a->mode==1 ? SYS_close_range : a->mode==2 ? SYS_clone : SYS_shmat;
+    unsigned action=a->mode==2 || a->mode==3 ? SECCOMP_RET_ERRNO|EACCES : SECCOMP_RET_KILL_THREAD;
     struct sock_filter code[]={
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,nr)),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,a->mode==0 ? SYS_mmap : a->mode==1 ? SYS_close_range : SYS_clone,0,1),
-        BPF_STMT(BPF_RET|BPF_K,a->mode==2 ? SECCOMP_RET_ERRNO|EACCES : SECCOMP_RET_KILL_THREAD),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,denied_call,0,1),
+        BPF_STMT(BPF_RET|BPF_K,action),
         BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)
     };
     struct sock_fprog program={sizeof(code)/sizeof(*code),code};
     assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
     assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
     for (unsigned n=0;n<8;++n) {
-        assert(shmat(a->id,a->address,0)==(void *)-1);
-        assert(errno==(a->mode==2 ? EACCES : ECANCELED));
+        char *address=shmat(a->id,NULL,0);
+        assert(a->mode!=4);
+        if (a->mode==3) assert(address==(void *)-1 && errno==EACCES);
+        else {
+            assert(address!=(void *)-1);
+            address[0]='F';
+            assert(!shmdt(address));
+        }
         struct shmid_ds info;
         assert(!shmctl(a->id,IPC_STAT,&info) && !info.shm_nattch);
     }
@@ -309,16 +320,20 @@ static void shm_terminal(void) {
     int filled[64]; unsigned count=0; int fd;
     while ((fd=fcntl(STDERR_FILENO,F_DUPFD_CLOEXEC,0))>=0) { assert(count<64); filled[count++]=fd; }
     assert(errno==EMFILE);
-    for (int protected=0;protected<2;++protected) for (int mode=0;mode<3;++mode) {
-        struct shm_attempt a={id,mode,protected,warm};
+    for (int protected=0;protected<2;++protected) for (int mode=0;mode<5;++mode) {
+        struct shm_attempt a={id,mode,protected};
         pid_t child=clone(shm_attempt,(char *)stack+65536,CLONE_VM|CLONE_FILES|SIGCHLD,&a);
-        assert(child>0); exited(child);
+        assert(child>0);
+        if (mode==4) {
+            int status;
+            assert(waitpid(child,&status,0)==child && WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
+        } else exited(child);
         for (int n=0;n<64;++n) assert(fcntl(n,F_GETFD)>=0);
         assert(fcntl(STDERR_FILENO,F_DUPFD_CLOEXEC,0)==-1 && errno==EMFILE);
         assert(!prctl(PR_SET_DUMPABLE,1));
         struct shmid_ds info;
         assert(!shmctl(id,IPC_STAT,&info) && !info.shm_nattch);
-        char *p=shmat(id,warm,0); assert(p==warm);
+        char *p=shmat(id,NULL,0); assert(p!=(void *)-1);
         p[0]='T'; assert(!shmdt(p));
     }
     while (count) assert(!close(filled[--count]));
@@ -469,9 +484,13 @@ static void wait_denied(void) {
     struct sock_fprog program={sizeof(code)/sizeof(*code),code};
     assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
     assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
+    struct timespec zero={0};
+    assert(syscall(SYS_ppoll,NULL,0,&zero,NULL,8)==-1 && errno==EACCES);
     struct sembuf op={0,-1,0};
-    assert(semop(id,&op,1)==-1 && errno==EACCES);
+    struct timespec timeout={.tv_nsec=1000000};
+    assert(semtimedop(id,&op,1,&timeout)==-1 && errno==EAGAIN);
     assert(!ctl(id,0,GETNCNT,0) && !ctl(id,0,IPC_RMID,0));
+    waiting("sem-wake");
 }
 static void wait_stopped(void) {
     int id=semget(IPC_PRIVATE,1,0600); assert(id>=0);
@@ -497,6 +516,9 @@ static void metadata_is(int sem,int msg,int shm,pid_t writer,pid_t creator) {
     struct msqid_ds queue; assert(!msgctl(msg,IPC_STAT,&queue));
     assert(queue.msg_lspid==writer && queue.msg_lrpid==writer);
     struct shmid_ds memory; assert(!shmctl(shm,IPC_STAT,&memory));
+    if (memory.shm_cpid!=creator || memory.shm_lpid!=writer)
+        fprintf(stderr,"SHM cpid=%d expected=%d lpid=%d expected=%d self=%d\n",
+            memory.shm_cpid,creator,memory.shm_lpid,writer,getpid());
     assert(memory.shm_cpid==creator && memory.shm_lpid==writer);
 }
 static void *metadata_thread(void *argument) {
@@ -521,6 +543,7 @@ static void metadata_write(int sem,int msg,int shm,pid_t creator) {
     assert(!kill(ctl(sem,0,GETPID,0),0));
 }
 static void pid_metadata(const char *self,unsigned levels) {
+    pid_t original=getpid();
     int sem=semget(IPC_PRIVATE,2,0600),msg=msgget(IPC_PRIVATE,0600),shm=shmget(IPC_PRIVATE,4096,0600);
     assert(sem>=0 && msg>=0 && shm>=0);
     assert(!ctl(sem,0,GETPID,0));
@@ -529,6 +552,7 @@ static void pid_metadata(const char *self,unsigned levels) {
     int current=-1;
     if (levels) { current=open("/proc/self/ns/pid",O_RDONLY|O_CLOEXEC); assert(current>=0); }
     if (levels) assert(!unshare(CLONE_NEWPID));
+    assert(getpid()==original);
     pid_t child=fork(); assert(child>=0);
     if (!child) {
         close(ready[0]);
@@ -550,6 +574,7 @@ static void pid_metadata(const char *self,unsigned levels) {
     /* Restore the namespace for subsequent pthread_create after nested PID 1
      * exits; CLONE_THREAD cannot join the child's now-dead namespace. */
     if (current>=0) { assert(!setns(current,CLONE_NEWPID)); close(current); }
+    assert(getpid()==original);
     metadata_is(sem,msg,shm,child,getpid());
     struct shmid_ds memory; assert(!shmctl(owned,IPC_STAT,&memory));
     assert(memory.shm_cpid==child && !memory.shm_lpid);

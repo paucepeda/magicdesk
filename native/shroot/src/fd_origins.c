@@ -1,6 +1,7 @@
 #include "fd_origins.h"
 #include "fd_channel.h"
 #include "fd_selector.h"
+#include "descriptor_inode.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -43,7 +44,7 @@ struct md_fd_origins {
     struct md_fd_loan_slot *loan_head;
 };
 static void entry_link(struct md_fd_origins *t,struct md_fd_origin_entry *e) {
-    if (e->object && e->object->type->readiness) ++t->readiness;
+    if (md_fd_object_has_readiness(e->object)) ++t->readiness;
     if (!e->loan) return;
     struct md_fd_loan_slot *slot=e->loan;
     slot->entry=e; slot->previous=NULL; slot->next=t->loan_head;
@@ -52,7 +53,7 @@ static void entry_link(struct md_fd_origins *t,struct md_fd_origin_entry *e) {
     atomic_fetch_add_explicit(&t->loans,1,memory_order_release);
 }
 static void entry_unlink(struct md_fd_origins *t,struct md_fd_origin_entry *e) {
-    if (e->object && e->object->type->readiness) --t->readiness;
+    if (md_fd_object_has_readiness(e->object)) --t->readiness;
     if (!e->loan) return;
     struct md_fd_loan_slot *slot=e->loan;
     if (slot->previous) slot->previous->next=slot->next;
@@ -200,6 +201,18 @@ int md_fd_origins_native_regular(const struct md_fd_order *turn,int fd) {
     struct md_fd_native native;
     return md_fd_origins_native(turn,fd,&native) && native.kind==S_IFREG;
 }
+int md_fd_origins_native_io(const struct md_fd_order *turn,int fd) {
+    if (md_fd_origins_native_regular(turn,fd)) return 1;
+    if (!turn || !turn->table || fd<0 || md_fd_order_state(turn)!=MD_RESOURCE_ORDER_RUNNING) return 0;
+    struct md_fd_origins *t=turn->table;
+    pthread_mutex_lock(&t->lock);
+    struct md_fd_origin_entry *e=t->buckets ? *slot(t,fd) : NULL;
+    /* Anonymous-pipe ownership supplies metadata only. Byte transfer, EOF,
+     * blocking and restart semantics belong entirely to its native OFD. */
+    int native=e && !e->uncertain && !e->loan && !e->channel && md_descriptor_inode_is(e->object);
+    pthread_mutex_unlock(&t->lock);
+    return native;
+}
 int md_fd_origins_close_untracked(const struct md_fd_order *turn,int number) {
     if (!md_fd_origins_exclusive(turn)) return 0;
     struct md_fd_origins *t=turn->table;
@@ -224,7 +237,7 @@ int md_fd_origins_native_poll_vector(const struct md_fd_order *turn,const struct
     if (t->readiness && t->buckets) for (size_t i=0;i<count;++i) {
         if (items[i].fd<0) continue;
         struct md_fd_origin_entry *e=*slot(t,items[i].fd);
-        if (e && e->object && e->object->type->readiness) { native=0; break; }
+        if (e && md_fd_object_has_readiness(e->object)) { native=0; break; }
     }
     pthread_mutex_unlock(&t->lock); return native;
 }
@@ -431,6 +444,8 @@ static struct md_fd_origin_entry *install(struct md_fd_origins *t,
     if (entry) entry_link(t,entry);
     if (entry) {
         entry->fd=fd; entry->next=retired ? retired->next : NULL; *p=entry;
+        if (entry->object && entry->object->type->published)
+            entry->object->type->published(entry->object);
     } else if (retired) *p=retired->next;
     if (retired) retired->next=NULL;
     return retired;

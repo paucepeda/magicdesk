@@ -69,14 +69,14 @@ final class ConsoleSessionFiles implements Closeable {
                 if (closed) { channel.close(); return Map.of(); }
                 bridge = channel;
                 if (backend != DesktopExecBackend.TERMUX) {
-                    var socket = new ExecutorSocketEndpoint(execution.uid, 10_000,
+                    var socket = new ExecutorSocketEndpoint(execution.uid, 10_000, execution.endpointFactory(),
                             fd -> channel.offer(ParcelFileDescriptor.dup(fd.getFileDescriptor())), failure -> channel.close());
                     admission = socket; endpoint = socket.name;
                 } else endpoint = channel.endpoint();
             }
             String helper = context.getApplicationInfo().nativeLibraryDir + "/libmagicdesk_guest_files.so";
             String launch = "export TMPDIR="
-                    + ShellCommandLine.quote(backend == DesktopExecBackend.TERMUX ? execution.home + "/../usr/tmp" : "/data/local/tmp")
+                    + ShellCommandLine.quote(execution.temporaryDirectory())
                     + " MAGICDESK_GUEST_FILES_SOCKET=" + ShellCommandLine.quote(endpoint)
                     + " MAGICDESK_GUEST_FILES_TOKEN=" + ShellCommandLine.quote(token)
                     + "\nexec " + ShellCommandLine.quote(helper) + " --serve";
@@ -110,7 +110,7 @@ final class ConsoleSessionFiles implements Closeable {
     synchronized String shellPaths(List<String> paths) {
         if (closed || directory.isEmpty()) return "";
         return items.stream().filter(item -> paths.contains(item.path()))
-                .map(item -> TerminalFilesEnvironment.quoteRelativePath(item.key() + "/" + item.name()))
+                .map(item -> TerminalFilesEnvironment.quotePath(directory, item.key() + "/" + item.name()))
                 .collect(java.util.stream.Collectors.joining(" "));
     }
     void subscribe(Runnable listener) { listeners.add(listener); }

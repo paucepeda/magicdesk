@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 
 from test_oci_services import Suite, add_machine_entry_argument, write_script
+from fixture_executor import FixtureExecutor
 from test_proot_debugger import run
 from test_development_runtime import development_sources
 
@@ -50,13 +51,16 @@ try:
     deadline = time.monotonic() + 10
     previous, since = None, time.monotonic()
     # Bounded observation: syscall 260 is ARM64 wait4, 73 is its interruptible
-    # runtime carrier. Signal the waiting tracer, not its attachment setup.
+    # runtime carrier. Resident entry parks on FUTEX_WAIT with channel state 8
+    # (MD_ENTRY_PARKED). Signal the waiting tracer, not its attachment setup.
     while True:
         current = Path('/proc/'+str(tracer.pid)+'/syscall').read_text().split()
         if current != previous:
             previous, since = current, time.monotonic()
         # Repeated identical observations exclude a transient attachment probe.
-        if current and current[0] in ('260', '73') and time.monotonic()-since >= 0.05:
+        parked = (len(current) >= 4 and current[0] == '98'
+                  and int(current[2], 0) == 0 and int(current[3], 0) == 8)
+        if current and (current[0] in ('260', '73') or parked) and time.monotonic()-since >= 0.05:
             break
         assert time.monotonic() < deadline, current
         time.sleep(0.001)
@@ -99,13 +103,14 @@ try:
         capture_output=True, text=True, timeout=20)
     print(result.stdout, result.stderr)
     assert result.returncode == 0
-    if target == 'gdb-poll-target':
-        assert 'gdb_poll_target' in result.stdout, result.stdout
+    if target in ('gdb-poll-target', 'gdb-epoll-target'):
+        assert target.replace('-', '_') in result.stdout, result.stdout
         assert 'corrupt stack' not in result.stdout, result.stdout
     output, _ = child.communicate('x', timeout=10)
     assert child.returncode == 0 and 'PASS '+target in output
     assert all(stage in result.stdout for stage in ('MD_ATTACHED', 'MD_BACKTRACE', 'MD_DETACHED'))
-    suffix = {'gdb-thread-target': '-threads', 'gdb-poll-target': '-poll'}.get(target, '')
+    suffix = {'gdb-thread-target': '-threads', 'gdb-poll-target': '-poll',
+              'gdb-epoll-target': '-epoll'}.get(target, '')
     print('PASS gdb-attach' + suffix)
 except subprocess.TimeoutExpired as error:
     print(error.stdout, error.stderr, flush=True)
@@ -243,7 +248,11 @@ for _ in range(4):
                  '-ex', 'python assert int(gdb.parse_and_eval("*address")) == ord("S")',
                  '-ex', 'echo MD_SHM_BREAK\\n', '-ex', 'continue']
 # EVENT_WAIT: four breakpoints and inferior completion; expiry is a failure.
-result = subprocess.run(commands, capture_output=True, text=True, timeout=25)
+try:
+    result = subprocess.run(commands, capture_output=True, text=True, timeout=25)
+except subprocess.TimeoutExpired as error:
+    print(error.stdout, error.stderr, flush=True)
+    raise
 print(result.stdout, result.stderr)
 assert result.returncode == 0 and result.stdout.count('MD_SHM_BREAK') == 4
 assert 'PASS shm-target' in result.stdout and 'exited normally' in result.stdout
@@ -262,7 +271,11 @@ for value in range(37, 41):
                  '-ex', 'python assert int(gdb.parse_and_eval("address[0]")) == '+str(0x52800000 | value << 5),
                  '-ex', 'echo MD_JIT_BREAK\\n', '-ex', 'continue']
 # EVENT_WAIT: each executable view reaches its breakpoint; expiry fails the run.
-result = subprocess.run(commands, capture_output=True, text=True, timeout=25)
+try:
+    result = subprocess.run(commands, capture_output=True, text=True, timeout=25)
+except subprocess.TimeoutExpired as error:
+    print(error.stdout, error.stderr, flush=True)
+    raise
 print(result.stdout, result.stderr)
 assert result.returncode == 0 and result.stdout.count('MD_JIT_BREAK') == 4
 assert 'PASS jit-target' in result.stdout and 'exited normally' in result.stdout
@@ -273,13 +286,14 @@ print('PASS gdb-jit')
 
 
 def commands(*, proot=False):
-    cases = [(name, [TARGET, name]) for name in ('attach', 'seize', 'trace-exit', 'syscall', 'syscall-edit-close', 'syscall-exec', 'syscall-signal', 'credential-transition', 'mixed',
+    cases = [(name, [TARGET, name]) for name in ('attach', 'seize', 'trace-exit', 'syscall', 'syscall-edit-close', 'syscall-exec', 'syscall-signal', 'credential-transition', 'mixed', 'wait-signal',
                                                'kill-stopped', 'owner-exit', 'exitkill', 'thread-exec', 'syscall-thread-exec', 'clone-untraced', 'shared-files-debugger', 'self-dump-threads', 'self-dump-io', 'perf-event')]
     cases.append(('strace-detach', ['python3', '-c', STRACE_DETACH]))
     cases.append(('strace-detach-socket', ['python3', '-c', STRACE_DETACH, '--socket']))
     cases.append(('gdb-attach', ['python3', '-c', GDB_ATTACH]))
     cases.append(('gdb-attach-threads', ['python3', '-c', GDB_ATTACH, 'gdb-thread-target']))
     cases.append(('gdb-attach-poll', ['python3', '-c', GDB_ATTACH, 'gdb-poll-target']))
+    cases.append(('gdb-attach-epoll', ['python3', '-c', GDB_ATTACH, 'gdb-epoll-target']))
     cases.append(('gdb-active-io', ['python3', '-c', GDB_IO]))
     cases.append(('gdb-attach-fork', ['python3', '-c', GDB_FORK, *([] if proot else ['--selector'])]))
     cases.append(('gdb-shm', ['python3', '-c', GDB_SHM]))
@@ -287,6 +301,9 @@ def commands(*, proot=False):
     cases.append(('lldb', ['python3', '-c', LLDB]))
     cases.append(('gdbserver', ['gdb', '--batch', '-nx', '-x', '/tmp/md-gdbserver.commands']))
     cases.append(('gprof', ['/bin/sh', '-ec',
+        'crt=$(gcc -print-file-name=gcrt1.o)\n'
+        'if [ "$crt" = gcrt1.o ] || [ ! -f "$crt" ]; then\n'
+        '  echo "UNAVAILABLE gprof: compiler does not supply gcrt1.o"; exit 0\nfi\n'
         'cd /tmp\ngcc -pg -O0 -g md-debugger-step.c -o md-debugger-profile\n'
         './md-debugger-profile\ntest -s gmon.out\n'
         'gprof ./md-debugger-profile gmon.out | grep answer\necho PASS gprof']))
@@ -295,10 +312,10 @@ def commands(*, proot=False):
         'grep "fn=.*answer" /tmp/md-callgrind.out\n'
         'grep -E "summary: [1-9]" /tmp/md-callgrind.out\necho PASS callgrind']))
     cases.append(('strace', ['/bin/sh', '-ec',
-        "strace -f -qq -o /tmp/md-debugger-strace.log /bin/sh -c 'cat /etc/passwd >/dev/null' 2>/tmp/md-debugger-strace.err\n"
+        "strace -f -qq -o /tmp/md-debugger-strace.log /bin/sh -c 'cat /etc/passwd >/dev/null; test -r /etc/passwd' 2>/tmp/md-debugger-strace.err\n"
         "cat /tmp/md-debugger-strace.err\n"
         "test ! -s /tmp/md-debugger-strace.err\n"
-        "grep -F 'openat(AT_FDCWD, \"/etc/passwd\", O_RDONLY)' /tmp/md-debugger-strace.log\n"
+        "grep -E 'openat\\(AT_FDCWD, \"/etc/passwd\", O_RDONLY(\\|O_LARGEFILE)?\\)' /tmp/md-debugger-strace.log\n"
         "grep 'execve(' /tmp/md-debugger-strace.log\n"
         "grep -E 'clone3?\\(' /tmp/md-debugger-strace.log\necho PASS strace"]))
     cases.append(('strace-shm', ['/bin/sh', '-ec',
@@ -321,6 +338,8 @@ def commands(*, proot=False):
 def outcome(name, output):
     if name == 'perf-event' and 'UNAVAILABLE perf-event errno=' in output:
         return {'passed': None, 'status': 'unavailable'}
+    if name == 'gprof' and 'UNAVAILABLE gprof: compiler does not supply gcrt1.o' in output:
+        return {'passed': None, 'status': 'unavailable', 'reason': 'toolchain lacks gcrt1.o'}
     passed = 'PASS '+name in output
     return {'passed': passed, 'status': 'passed' if passed else 'failed'}
 
@@ -334,12 +353,14 @@ def main():
     parser.add_argument('--build', type=Path)
     parser.add_argument('--case', action='append', choices=[name for name, _ in commands()])
     parser.add_argument('--diagnostics', action='store_true')
+    FixtureExecutor.add_argument(parser)
     add_machine_entry_argument(parser)
     parser.add_argument('--pid-namespace', action='store_true')
     parser.add_argument('--gdbserver-binary', type=Path,
                         help='Optional standalone guest binary; never replaces the installed package')
     args = parser.parse_args()
-    if args.proot and (args.build or args.diagnostics or args.pid_namespace or args.machine_entry is not None):
+    if args.proot and (args.build or args.diagnostics or args.pid_namespace or args.machine_entry is not None
+                      or args.executor == 'app'):
         parser.error('runtime and namespace options apply only to Shroot')
     args.output.mkdir(parents=True, exist_ok=True)
     source = Path(__file__).with_name('test_debugger_guest.c')
@@ -354,6 +375,7 @@ def main():
     assert cases
     if args.proot:
         env = os.environ.copy()
+        env['LC_ALL'] = 'C'
         report = {'uid': os.getuid(), 'kernel': os.uname().release, 'cases': []}
         with tempfile.TemporaryDirectory(prefix='md-debugger-') as temporary:
             Path(temporary, 'md-debugger-step.c').write_text(step)
@@ -377,10 +399,10 @@ def main():
         report['passed'] = all(c['passed'] is not False for c in report['cases'])
         (args.output / 'proot.json').write_text(json.dumps(report, indent=2)+'\n')
     else:
-        suite = Suite(args.output, args.build, machine_entry=args.machine_entry)
+        suite = Suite(args.output, args.build, machine_entry=args.machine_entry, executor=args.executor)
         try:
             if args.gdbserver_binary:
-                suite.transport.upload(suite.client, args.gdbserver_binary, suite.base+'/md-gdbserver')
+                suite.upload(args.gdbserver_binary, suite.base+'/md-gdbserver')
                 suite.command(suite.run(args.instance, '--bind-ro', suite.base, '/mnt', '--',
                                         '/bin/sh', '-ec', 'cp /mnt/md-gdbserver /tmp/md-gdbserver; chmod 755 /tmp/md-gdbserver'))
             write_script(suite, args.instance, TARGET+'.c', source.read_text())
@@ -391,15 +413,17 @@ def main():
             for name, argv in cases:
                 case = {'name': name, 'passed': False}; suite.report['cases'].append(case)
                 try:
-                    options = ['--diagnostics'] if args.diagnostics else []
+                    options = ['--env', 'LC_ALL=C']
+                    if args.diagnostics:
+                        options.append('--diagnostics')
                     child = (['unshare', '--mount', '--pid', '--fork', '--mount-proc']
                              if args.pid_namespace else []) + argv
-                    if args.diagnostics or args.pid_namespace:
+                    if args.pid_namespace:
                         command = [suite.runner, *suite.entry_options, *options, '--store', args.instance,
                                    '--user', '0:0', '--', '/bin/sh', '-c', 'exec "$@"',
                                    'debugger-test', *child]
                     else:
-                        command = suite.run(args.instance, *(['--user', '0:0']
+                        command = suite.run(args.instance, *options, *(['--user', '0:0']
                             if name == 'credential-transition' else []), '--', *argv)
                     output = suite.command(command, timeout=35)
                     case.update(outcome(name, output))
@@ -409,7 +433,10 @@ def main():
                 print(name, case, flush=True)
             suite.report['passed'] = all(c['passed'] is not False for c in suite.report['cases'])
         finally:
-            suite.finish()
+            try:
+                suite.command(['rm', '-rf', '--', suite.base], quiet=True)
+            finally:
+                suite.finish()
         report = suite.report
     if args.gdbserver_binary:
         with args.gdbserver_binary.open('rb') as binary:

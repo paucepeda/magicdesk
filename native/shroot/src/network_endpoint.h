@@ -20,6 +20,8 @@ void md_network_endpoint_nat_ports(struct md_network_namespace *,const struct md
 /* Resolve a logical destination to its current socket, without retaining it. */
 int md_network_endpoint_resolve(struct md_network_fabric *,struct md_network_flow_path *,int,struct md_inet_address *,const void **);
 int md_network_endpoint_reply(struct md_network_fabric *,const struct md_network_flow_path *,const struct md_inet_address *);
+/* Under the fabric lock: a connected receiver still owns its relay peer port. */
+int md_network_endpoint_connected_peer(const void *,const struct md_network_flow_path *);
 struct md_network_packet_info { unsigned interface; struct md_ip_address source, destination; int hops, hops_set; };
 static inline int md_network_endpoint_option(unsigned level,unsigned option) {
     return md_network_transport_option(level,option) || md_network_multicast_option(level,option)
@@ -57,6 +59,7 @@ int md_network_endpoint_accept(struct md_fd_object *,int,struct md_fd_object **)
 struct md_network_endpoint_info {
     uint64_t inode;
     uint32_t uid;
+    unsigned state;
     struct md_inet_address local, peer;
 };
 /* An owned, namespace-scoped snapshot, sorted by native socket inode. */

@@ -64,8 +64,9 @@ static int finish_snapshot(struct md_fs_storage_scope *scope,int result) {
     }
     return result;
 }
-static int target_stat(struct md_filesystem *fs,const struct md_view_mount *m,
-        struct md_fs_storage_scope *scope,struct stat *st) {
+static int target_removed(struct md_filesystem *fs,const struct md_view_mount *m,
+        struct md_fs_storage_scope *scope) {
+    struct stat st;
     int r=0;
     if (md_view_inode(m->parent)) {
         struct md_inode_lifetime *storage=m->parent->storage ? m->parent->storage : fs->store->lifetime;
@@ -78,12 +79,14 @@ static int target_stat(struct md_filesystem *fs,const struct md_view_mount *m,
                 if (r) md_fs_storage_leave(scope);
             }
         }
-        if (!r) r=md_inode_fstat(scope->store,m->target,st);
+        if (!r) r=md_inode_fstat(scope->store,m->target,&st);
     } else {
         r=finish_snapshot(scope,0);
-        if (!r && fstat(m->target,st)) r=-errno;
+        if (!r && fstat(m->target,&st)) r=-errno;
     }
-    return r;
+    /* proc dentries can lose their task before their retained target FD is
+     * released. ENOENT and an unlinked inode both retire that placement. */
+    return r ? (r==-ENOENT ? 1 : r) : !st.st_nlink;
 }
 int md_view_mount_reconcile_branch(struct md_filesystem *fs,struct md_view_mount *mount) {
     struct md_mount_namespace *view=fs->mounts;
@@ -97,9 +100,9 @@ int md_view_mount_reconcile_branch(struct md_filesystem *fs,struct md_view_mount
     for (struct md_view_mount *m=mount;m && m->parent && !r;m=m->parent) {
         if (++depth>view->tree->count+1) { r=-ELOOP; break; }
         if (m->detached) break;
-        struct stat st;
-        r=target_stat(fs,m,&scope,&st);
-        if (!r && !st.st_nlink) missing=m;
+        int removed=target_removed(fs,m,&scope);
+        if (removed<0) r=removed;
+        else if (removed) missing=m;
     }
     r=finish_snapshot(&scope,r);
     if (!r && missing) {
@@ -118,26 +121,30 @@ int md_view_mount_reconcile_branch(struct md_filesystem *fs,struct md_view_mount
     md_cost_end(cost,start);
     return r;
 }
-int md_view_mount_reconcile(struct md_filesystem *fs) {
+static int reconcile(struct md_filesystem *fs,const struct md_view_mount *root) {
     struct md_mount_namespace *view=fs->mounts;
     if (!view || !view->tree) return 0;
     struct md_cost *cost=fs->statistics ? &fs->statistics->mount_reconcile : NULL;
     int64_t start=md_cost_begin(cost);
     unsigned removed[view->tree->count+1], order[view->tree->count+1], changed=0;
+    unsigned char selected[view->tree->count+1];
     memset(removed,0,sizeof(removed));
+    memset(selected,0,sizeof(selected));
     int r=md_view_topology_order(view,order);
     struct md_fs_storage_scope scope={0};
     for (unsigned n=0;!r && n<=view->tree->count;++n) {
         unsigned i=order[n];
         const struct md_view_mount *m=md_view_mount_node(view,i);
+        selected[i]=!root || m==root || (m->parent && selected[node_index(view,m->parent)]);
+        if (!selected[i]) continue;
         if (!m->id || m->detached || !m->parent) continue;
         if (removed[node_index(view,m->parent)]) removed[i]=1;
         else {
-            struct stat st;
             /* One fresh snapshot per consecutive store run. Never hold
              * a store gate across another provider or topology changes. */
-            r=target_stat(fs,m,&scope,&st);
-            if (!r) removed[i]=!st.st_nlink;
+            int missing=target_removed(fs,m,&scope);
+            if (missing<0) r=missing;
+            else removed[i]=(unsigned)missing;
         }
         changed|=removed[i];
     }
@@ -145,4 +152,12 @@ int md_view_mount_reconcile(struct md_filesystem *fs) {
     if (!r && changed) r=detach(fs,removed);
     md_cost_end(cost,start);
     return r;
+}
+int md_view_mount_reconcile(struct md_filesystem *fs) {
+    return reconcile(fs,NULL);
+}
+int md_view_mount_reconcile_subtree(struct md_filesystem *fs,struct md_view_mount *root) {
+    int r=md_view_mount_reconcile_branch(fs,root);
+    if (r || (root && (root->detached || !md_view_mount_children(fs->mounts,root)))) return r;
+    return reconcile(fs,root);
 }

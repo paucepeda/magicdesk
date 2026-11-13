@@ -1,9 +1,13 @@
 # Shroot Native Runtime
 
-Shroot is a native ARM64 Linux userspace runtime for MagicDesk's already-authorized
-shell or root executor. Shell UID 2000 is the unrooted baseline. The APK packages
-standalone executables, not libraries loaded into ART. Guest-only capabilities
-are probed on explicit use and never become prerequisites for other services.
+Shroot is a native ARM64 Linux userspace runtime with one engine for the User
+(MagicDesk app UID) and Shell (authorized UID 2000 or 0) executors. Both use the
+same [fixtures and contracts](../guest-exec-lab/host-execution.md), with separate
+storage and retained launch identities. A root-backed Shell service is not a
+separate native-root implementation.
+The APK packages standalone executables, not libraries loaded into ART.
+Guest-only capabilities are probed on explicit use and never become
+prerequisites for other services.
 
 Start with the [user guide](../../docs/shroot.md) for installation, named
 environments, Docker/Podman, init systems and supported application workflows.
@@ -29,8 +33,14 @@ Lazy machine-code entry admits observed AArch64 SVC sites in unmodified programs
 including stock libc and Go, by default for inode-store launches. It shares the
 [cooperative channel](cooperative-entry.md) and syscall owners, not a second
 implementation.
-Application filters, protected-state transitions and debugger ownership revoke
-entry through the common admission boundary. Unavailable capabilities and
+Admitted task operations reach the existing supervisor/resource owners over that
+same channel. Their guest-thread C execution and native-effect acknowledgements
+share Base's dispatcher and retirement; ordinary worker/native fast paths remain
+direct. Kernel stops are retained for actual task-context requirements, not for
+scalar control messaging.
+Application filters fence entry and publish immutable original-policy views
+before eligible calls resume acceleration. Debugger ownership and unavailable
+policy views retain the common fallback. Unavailable capabilities and
 unsupported sites retain Base interception; `--env SHROOT_MACHINE_ENTRY=0`
 selects Base explicitly. See
 [integration evidence](../guest-exec-lab/svc-rewriting.md#product-boundary).
@@ -38,7 +48,8 @@ selects Base explicitly. See
 One supervisor owns each process tree. Selective seccomp TRACE/USER_NOTIF directs
 operations needing adaptation to either a task-affine adapter or a filesystem
 worker. The supervisor is the sole kernel ptracer. Ordinary unselected data IO,
-memory, futex and signal-mask operations retain native execution; signal sending
+memory and futex operations retain native execution. Signal masks also stay
+native unless inherited Android policy requires the logical SIGSYS view. Signal sending
 always checks launch membership and guest credentials, even without a PID
 namespace. Group/broadcast sends select only supervised guest processes, never
 other Android processes sharing the executor UID. Features such as
@@ -73,12 +84,33 @@ Android kernel: actual task lifetime, descriptors, data IO and native checks
 | Application services | Authorization, catalog/registry downloads, launch recipes, immutable helper staging, PTY, graphics/audio/input connections | Guest syscall policy or native resource lifetime |
 | `namespace_run.c` | Explicit launch configuration and native process owner | Global current distribution or automatic privilege switching |
 | `bootstrap.c`, `elf.c`, `exec.c` | ELF admission/mapping, stack and exec reentry | Distribution-specific loader or libc policy |
-| `supervisor.c` and task owners | Kernel tracing, continuations, guest identity, cancellation and terminal cleanup | Android windows or a second kernel scheduler |
+| `supervisor.c` | Launch services, event-loop ordering, progress and cancellation | Operation-specific syscall implementations |
+| `supervisor_task.c`, `supervisor_debug.c`, `supervisor_robust.c` | Task birth/exec/exit, guest debugger boundaries and retained robust-futex actors | Independent event loops |
+| `supervisor_execution.c` | Shared entry, dispatch, native-effect completion and continuation selection | Duplicated resource semantics for TRACE and cooperative entry |
+| `supervisor_actors.c`, `supervisor_memory.c` | Borrowed task calls, quiescence custody, mappings and private-memory repair | Unconditional process-tree stops |
+| `supervisor_fs.c`, `supervisor_notifications.c`, `supervisor_proc.c` | Filesystem transport, notification reconciliation and guest proc views | Filesystem provider implementations |
+| `supervisor_descriptors.c`, `supervisor_io.c`, `supervisor_domain.c` | Descriptor operations, captured IPC/control IO and namespace transitions | Interception of ordinary native read/write |
+| `supervisor_identity.c` | Credential calls, capabilities and resource-limit copies | Native Android identity changes |
+| `supervisor_signals.c` | Guest signal delivery, pending signals, masks, frames and signalfd publication | Independent task scheduling |
+| `supervisor_seccomp.c` | Guest policy admission, listeners, TSYNC and inherited host-policy delivery | A second syscall implementation |
+| `supervisor_readiness.c` | Poll/epoll admission, descriptor loans, waits and interruption | Ordinary native data IO |
 | `fs_worker.c`, `namespace_broker.c`, `fs_engine.c` | Captured filesystem requests and provider dispatch | Application IO through ordinary open data descriptions |
 | Inode/image owners | SQLite namespace, metadata, shared bodies, overlays, import and maintenance | Android mount privileges or kernel hardlinks |
 | `fs_continuation.c`, provider continuations | Captured asynchronous filesystem stages and cancellation | Blocking the filesystem worker while a guest daemon runs |
 | `fuse_device.c`, `fuse_session.c`, `fuse_view.c`, `fuse_file.c` | Guest FUSE transport, mount protocol, names and open descriptions | Native Android FUSE permission or a coherent shared page cache |
-| Guest adapter | Task-affine operations and protected-memory copying | SQLite, a libc dependency or app-side services |
+| `guest_execution.c` and operation handlers | Admitted task-affine operations, shared by ingress adapters | Register ABI, tracee resume or a second resource model |
+| `interception.c`, `cooperative_entry.h`, resident SVC driver | Register adaptation, caller actions and continuation delivery | Duplicated syscall semantics, SQLite or app-side services |
+
+The supervisor operation modules are separate translation units in the same
+process and event thread. Their private headers describe continuation state and
+direct calls; `supervisor_thread.h` embeds each operation owner's state in the
+shared task record, without per-call allocation or another dispatch layer, and
+`supervisor_internal.h` exposes coordinator services. These are not guest ABI or
+worker RPC interfaces. Each operation owner handles its control messages,
+continuations and cancellation; the coordinator preserves event custody and
+ordering. The supervisor-state fixture compiles these same sources together for
+white-box assertions, without exporting test-only entry points or duplicating
+their state machines. Production builds compile each owner separately.
 
 `GuestEnvironmentLibrary` and `GuestOciRegistry` are app-side management, not
 part of this native module. Their Java command helper is short-lived; the
@@ -109,7 +141,7 @@ Low-level framing is shared without moving resource policy into the parser:
 - `task_memory` reads guest strings in page-bounded chunks. A terminator before
   an inaccessible page remains valid; callers preserve their own error contract.
   Retained-memory reads require explicit owner-provided authority. Executable
-  metadata uses it only for same-process inspection after `dumpable=0`, never
+  metadata uses it only for authorized same-process inspection, never
   to authorize a foreign process's proc access.
 - `received_fds` owns exclusive parcel accumulation, immutable shared custody
   and provenance. Geometric growth transfers no FD twice and leaves both inputs
@@ -122,6 +154,11 @@ file data. Logical owners follow their own sharing rules: address space,
 `CLONE_FILES`, `CLONE_FS`, namespace membership and `CLONE_SYSVSEM` are distinct.
 Fork, unshare and exec prepare changes before native execution and publish only
 confirmed results. Native rejection preserves prior ownership.
+
+[Robust mutex cleanup](process-lifetime.md#robust-mutex-ownership) uses the shared
+retained-memory, task-call and child-reaping owners under User and logical PID
+namespaces. Shell otherwise retains native cleanup. Ordinary futex IO remains
+native in both executors.
 
 The event loop services ptrace, worker and descriptor completions together.
 Task and memory progress uses bounded event-count batches between readiness
@@ -224,6 +261,72 @@ descriptors and the same-UID broker retain authority outside guest policy;
 interpreter/library admission and complete descriptor/root confinement remain
 incomplete. Use trusted inputs.
 
+`seccomp_install.h` classifies both installation APIs and their native results
+for the shared supervisor: listener FDs are successful results, while a
+positive-TID TSYNC failure does not publish a new filter. Both host identities
+reuse that contract. `seccomp_policy` supplies immutable snapshots,
+chain references and selective cBPF routing. `seccomp_program` is the shared
+allocation-free evaluator for coordinator objects and read-only entry views;
+it has no syscall, listener or scheduler ownership. View export can retain an
+existing ancestor mapping instead of copying the whole chain on each install.
+Each immutable chain caches only proven argument/IP-independent ALLOW decisions;
+all other inputs retain interpretation. This cache is built at installation,
+not in ordinary syscall handling. IP-independent chains with an allowed inert
+checkpoint can publish fresh entry views after exec. IP-sensitive inherited
+chains retain Base; old code-pool addresses never authorize a new image.
+Owned service gates use one exact-PC/range matcher with optional syscall scope;
+IP-independent constant-ALLOW exits retain the kernel's cacheable path.
+IP-dependent policies route owned aliases before evaluation so original-site
+recovery cannot be bypassed by a different ALLOW decision at the alias.
+Application-UID
+execution uses it to admit cold Android-denied calls against original guest policy;
+the ordinary UID-2000 path does not enable host-SIGSYS translation.
+`seccomp_capture` lends the exact routed image from a peer-read-only
+`interception_buffers` pool until native completion or confirmed death. The
+caller owns guest copies and the existing address-space turn against mapping
+replacement; the policy module owns no guest memory, signal frames or process
+scheduler. Ordinary writable request pools are unchanged. See the
+[host execution contract](../guest-exec-lab/host-execution.md) for current
+coverage and limitations.
+
+The `seccomp_notify` owner supplies a virtual notification queue
+through the existing control-file ioctl/readiness model. The typed listener
+uses ordinary FD-table, fork and SCM_RIGHTS ownership. Its output acknowledgement
+reuses terminal buffer completion, and is requested only by RECV-like operations
+whose state depends on successful guest copying. The queue and last-close
+semantics, last-task HUP independent of FD lifetime, receiver-relative PID views
+and metadata-only O_PATH reopenings are coordinator-tested. Guest filter
+installation, original-call dispatch, CONTINUE, interruption/restart and ADDFD
+are connected to this owner. Typed ioctl input capture and `fd_install` retain
+source OFDs, fixed-slot metadata and atomic SEND semantics, including protected
+callers. Native read/write/poll paths do not consult this queue.
+
+The engine's `signal_actions`, `signal_view` and `task_signal_control`
+owners preserve logical SIGSYS actions, masks, pending state and handler-entry
+frames, including nonlocal handler exits. Proc status and debugger mask views
+reuse those owners; proc status does not expose an adapter's temporary mask.
+Protected copying borrows the existing `task_call` owner;
+ordinary native IO acquires no additional turn or observation. `signal_pending`
+separates thread-private and process-shared SIGSYS queues and the shared-sighand
+wait domain. Other signals retain native kernel queues. `signal_fd` integrates
+signalfd/read/readv, typed FD transfer, poll and task-affine epoll through the
+existing descriptor owners. Epoll publication commits logical ET/ONESHOT state
+only after the caller's copy succeeds; native task events validate the actual
+output buffer before consumption. The mapping turn covers that nonblocking
+publication, never a blocking wait. Parked waits release shared transport slots.
+
+Temporary masks for ppoll, pselect6, epoll_pwait/pwait2 and sigsuspend retain
+kernel handler-entry and sigreturn semantics, including nonlocal handler exits.
+TSYNC retains immutable admission snapshots for already admitted calls and
+pending Android denials. A group barrier is limited to filter installation;
+ordinary syscalls do not acquire global entry tracing. Owned completion gates
+finish the original admitted request without replaying it through a later filter.
+This admission/notification lifecycle is shared by app UID and UID 2000;
+only translation of Android's inherited SIGSYS policy is app-UID-specific.
+`guest_debugger` supplies typed seccomp events only when its host explicitly
+owns guest-filter admission. The production supervisor does not enable that
+TRACESECCOMP capability.
+
 See [guest credentials and Landlock](../../docs/shroot.md#guest-credentials),
 [namespace providers](process-resources.md) and
 [image admission](interception.md#image-admission-and-logical-credentials).
@@ -263,7 +366,7 @@ adaptation.
 | Contract | Responsibility |
 | --- | --- |
 | [Interception](interception.md) | Selectors, task-affine calls, protected processes, exec, application filters and private-memory repair |
-| [Cooperative entry](cooperative-entry.md) | Shared direct entry, worker ownership, bounded operation windows, fallback and filter limits |
+| [Cooperative entry](cooperative-entry.md) | Shared exchange, guest/worker/supervisor execution ownership, bounded operation windows, fallback and filter limits |
 | [Process lifetime](process-lifetime.md) | Launch ownership, cancellation, reaping and teardown |
 | [Process resources](process-resources.md) | Sharing, mounts, namespace providers, descriptor custody, network, terminals and cgroups |
 | [Namespace execution](namespace-execution.md) | Path/FD dispatch, cwd, metadata and proc object identity |

@@ -12,6 +12,7 @@
 #include "ofd_order.h"
 #include "file_open_job.h"
 #include "fifo_description.h"
+#include "pty_events.h"
 #include "exec_prepare.h"
 #include "file_snapshot.h"
 #include "ipc_credentials.h"
@@ -66,6 +67,8 @@ struct md_fs_buffer_request {
     int restricted;
     int64_t position;
     struct md_fs_context context;
+    enum { STATUS_NONE, STATUS_CAPTURING, STATUS_CAPTURED } status_capture;
+    char status_path[64];
     struct md_fs_continuation *continuation;
     struct md_exec_preparation *execution;
     struct md_fs_buffer_frame *output;
@@ -236,6 +239,14 @@ static int complete(struct md_fs_work *work) {
         r->submitted=1; md_fs_worker_publish(r->service->worker,work); return 0;
     }
     r->submitted=0;
+    if (!r->cancelled && r->opening_wait) {
+        r->service->complete(r,r->actor,0);
+        return 0;
+    }
+    if (!r->cancelled && r->capturing) {
+        r->service->complete(r,r->actor,0);
+        return 0;
+    }
     if (!r->cancelled && r->executable && r->error==-EREMOTE && r->proc_image) {
         r->error=r->service->exec_capture
             ? r->service->exec_capture(r->actor,r->proc_image) : -EOPNOTSUPP;
@@ -344,8 +355,7 @@ int md_fs_buffer_child(struct md_fs_buffer_service *s, pid_t pid, int status) {
         r->output->reply.result.error=result;
         r->output->transfer=MD_FS_BUFFER_NO_FD;
     }
-    if (r->opening_wait && !r->cancelled) r->service->complete(r,r->actor,0);
-    else complete(&r->work);
+    complete(&r->work);
     return 1;
 }
 static void submit(struct md_fs_buffer_request *r, int error) {
@@ -418,13 +428,29 @@ int md_fs_buffer_capture_pending(const struct md_fs_buffer_request *r) {
     return r && r->capturing;
 }
 int md_fs_buffer_capture_start(struct md_fs_buffer_request *r) {
-    if (!r || r->capturing!=1 || r->cancelled
-            || md_fd_order_state(&r->files)!=MD_RESOURCE_ORDER_RUNNING
-            || md_fs_order_state(&r->order)!=MD_RESOURCE_ORDER_RUNNING) return -EINVAL;
+    if (!r || r->capturing!=1 || r->cancelled) return -EINVAL;
+    if (r->status_capture!=STATUS_CAPTURING && !(r->continuation && r->continuation->task_input)
+            && (md_fd_order_state(&r->files)!=MD_RESOURCE_ORDER_RUNNING
+                || md_fs_order_state(&r->order)!=MD_RESOURCE_ORDER_RUNNING)) return -EINVAL;
     r->capturing=2; return 0;
 }
-int md_fs_buffer_capture_target(const struct md_fs_buffer_request *r, struct md_fs_task_capture *out) {
-    if (!r || !r->capturing || !out || !r->capture_mask) return -EINVAL;
+int md_fs_buffer_capture_target(const struct md_fs_buffer_request *r, struct md_fs_task_capture *out,int *metadata,size_t *directory_limit,
+        struct md_fs_task_subject *subject) {
+    if (!r || !r->capturing || !out) return -EINVAL;
+    if (metadata) *metadata=0;
+    if (directory_limit) *directory_limit=0;
+    if (subject) *subject=(struct md_fs_task_subject){0};
+    if (r->status_capture==STATUS_CAPTURING) {
+        *out=(struct md_fs_task_capture){r->status_path,O_CLOEXEC}; return 0;
+    }
+    if (r->continuation && r->continuation->task_input) {
+        *out=r->continuation->task_input->request;
+        if (subject) *subject=r->continuation->task_input->subject;
+        if (metadata) *metadata=1;
+        if (directory_limit) *directory_limit=r->continuation->task_input->directory_limit;
+        return out->path ? 0 : -EINVAL;
+    }
+    if (!r->capture_mask) return -EINVAL;
     *out=r->request.capture[r->capture_mask&1 ? 0 : 1];
     return out->path ? 0 : -EINVAL;
 }
@@ -435,15 +461,38 @@ static void capture_begin(struct md_fs_buffer_request *r) {
     r->capturing=1;
     r->service->complete(r,r->actor,0);
 }
-int md_fs_buffer_capture_finish(struct md_fs_buffer_request *r, int descriptor, int error) {
+int md_fs_buffer_capture_finish(struct md_fs_buffer_request *r, int descriptor, int error,const struct stat *metadata,
+        void *directory,size_t directory_size) {
     if (!r || !r->capturing || error>0 || error < -4095 || (!error && descriptor<0)) {
+        free(directory);
         if (descriptor>=0) close(descriptor);
         return -EINVAL;
     }
     r->capturing=0;
     if (r->cancelled) {
+        free(directory);
         if (descriptor>=0) close(descriptor);
         dispose(r); return 0;
+    }
+    struct md_fs_task_input *input=r->continuation ? r->continuation->task_input : NULL;
+    if (directory && input && !input->completed && !error && directory_size<=input->directory_limit) {
+        input->directory=directory; input->directory_size=directory_size;
+    } else {
+        if (directory && !error) error=-EPROTO;
+        free(directory);
+    }
+    if (r->status_capture==STATUS_CAPTURING) {
+        r->status_capture=STATUS_CAPTURED;
+        if (!error) error=md_task_snapshot_status_install(&r->context.task,descriptor);
+        else if (descriptor>=0) close(descriptor);
+        submit(r,error); return 0;
+    }
+    if (input) {
+        if (input->completed) { if (descriptor>=0) close(descriptor); return -EPROTO; }
+        if (!error && !metadata) error=-EPROTO;
+        if (metadata) input->metadata=*metadata;
+        input->descriptor=descriptor; input->error=error; input->completed=1;
+        submit(r,0); return 0;
     }
     if (!error) {
         int owned=0;
@@ -566,14 +615,27 @@ static int continuation_ready(struct md_fs_work *work) {
 static int execute_context(struct md_fs_buffer_request *r,struct md_fs_result *result,struct md_fs_output *output) {
     struct md_fs_continuation *previous=r->continuation;
     output->continuation=&r->continuation;
+    output->task_capture=r->output!=NULL;
     if (previous) md_fs_context_resume(&r->context,previous,result,output);
     else md_fs_context_execute(&r->context,&r->request,result,output);
+    if (result->requires_task_capture && !r->output) {
+        r->error=MD_FS_BUFFER_NEEDS_TASK; return 1;
+    }
+    if (result->requires_task_status && r->output && !previous && r->status_capture==STATUS_NONE) {
+        /* Admission has not touched the filesystem. Retain the exact task and
+         * operands while obtaining a native handle from its own thread group. */
+        snprintf(r->status_path,sizeof(r->status_path),"/proc/%d/status",r->actor);
+        r->status_capture=STATUS_CAPTURING; r->capturing=1;
+        return 0;
+    }
     if (md_fs_continuation_pending(previous,&r->continuation,result)) {
         if (r->order.fs) {
             int error=md_fs_order_complete(&r->order);
             if (error) { r->error=error; return 0; }
         }
-        r->work.await=continuation_ready; return 0;
+        if (r->continuation->task_input && !r->continuation->task_input->completed) r->capturing=1;
+        else r->work.await=continuation_ready;
+        return 0;
     }
     return 1;
 }
@@ -698,6 +760,11 @@ static void prepare_open(struct md_fs_buffer_request *r,struct md_filesystem *fs
     struct md_fs_response *reply=&r->output->reply;
     r->output->source_verify=0;
     if (r->opened.fd>=0) {
+        if (!r->error && !reply->result.error && r->opened.origin && !r->opened.object) {
+            r->error=md_pty_events_open(&fs->pty_events,r->opened.fd,r->opened.origin,r->request.flags,
+                r->opened.completion.kind==MD_OPEN_CALLER,&r->opened.object);
+            if (r->error) return;
+        }
         if (r->reopened) {
             md_fs_anchor_release(r->opened.origin); r->opened.origin=NULL;
             md_fd_object_release(r->opened.object);
@@ -1086,11 +1153,35 @@ static struct md_fs_anchor *capture_origin(struct md_fs_buffer_request *r,unsign
     md_task_snapshot_release(&target);
     return origin;
 }
+static int capture_native_path(struct md_fs_buffer_request *r,unsigned index,const struct md_proc_path *path) {
+    const struct md_fs_task_capture *capture=&r->request.capture[index];
+    if (!(capture->flags&O_PATH) || md_domain_restricted(r->context.task.fs)) return 0;
+    struct md_task_snapshot target={0};
+    if (md_task_registry_read(r->service->tasks,path->process,r->context.task.tgid,&target)) return 0;
+    struct md_fd_native native={0};
+    /* Same-process proc lookup needs no ptrace permission. The held table
+     * turn preserves this exact dentry across a peer's close or unshare. */
+    int found=target.tgid==r->context.task.tgid && target.files==r->files.table
+        && !md_domain_restricted(target.fs) && md_fd_origins_native(&r->files,path->descriptor,&native);
+    if (found) r->input[index]=md_fs_anchor_retain(native.origin);
+    md_task_snapshot_release(&target);
+    if (!found) return 0;
+    if ((capture->flags&O_DIRECTORY) && native.kind!=S_IFDIR) return -ENOTDIR;
+    r->request.origin[index]=r->input[index];
+    r->request.directory[index]=md_fs_anchor_fd(r->input[index]);
+    r->capture_mask&=~(1U<<index);
+    r->request.capture[index]=(struct md_fs_task_capture){0};
+    return 1;
+}
 static int capture_proc_object(struct md_fs_buffer_request *r,unsigned index) {
     const struct md_fs_task_capture *capture=&r->request.capture[index];
     if (!capture->path || (capture->flags&O_NOFOLLOW)) return 0;
     struct md_proc_path path=md_proc_path_for(capture->path,r->context.task.tid,r->context.task.tgid);
     enum md_proc_kind kind=path.kind==MD_PROC_FOREIGN ? path.foreign_kind : path.kind;
+    if (kind==MD_PROC_FD && path.tail && !*path.tail) {
+        int found=capture_native_path(r,index,&path);
+        if (found) return found;
+    }
     if (kind==MD_PROC_FD && !*path.tail && r->request.operation==MD_FS_PATH
             && r->service->control_capture) {
         struct md_fd_object *object=NULL;
@@ -1209,10 +1300,12 @@ int md_fs_buffer_progress(struct md_fs_buffer_service *s) {
             }
             if (base==AT_FDCWD) r->input[i]=md_fs_anchor_retain(r->context.task.cwd);
             else if (base>=0) r->input[i]=md_fd_origins_get(r->files.table,base,NULL);
-            if (!i && r->request.operation==MD_FS_FSTAT && md_fs_anchor_virtual(r->input[i])) {
+            if (!i && base>=0 && r->request.operation==MD_FS_FSTAT) {
                 r->control_input=md_fd_origins_object(r->files.table,base,NULL);
                 int found=s->control_query ? s->control_query(r->control_input,r->request.operation,&r->request.control) : 0;
-                if (found<=0) { error=found ? found : -EOPNOTSUPP; break; }
+                if (found<0 || (!found && md_fs_anchor_virtual(r->input[i]))) {
+                    error=found ? found : -EOPNOTSUPP; break;
+                }
             }
             if (!i && base>=0 && !r->input[i] && r->request.operation==MD_FS_MOUNT && s->control_query) {
                 struct md_fd_object *object=md_fd_origins_object(r->files.table,base,NULL);

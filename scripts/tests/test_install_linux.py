@@ -1,4 +1,5 @@
 """Installer orchestration without modifying the host or downloading packages."""
+import configparser
 import errno
 import gzip
 import io
@@ -529,18 +530,61 @@ if os.environ.get("TEST_FAIL") == stage and "MAGICDESK_BUILD_PHASE=dependencies"
         self.assertIn('unshare --mount --pid --fork --mount-proc --uts --ipc --cgroup', helper)
         self.assertIn('[ "$$" = 1 ]', helper)
         self.assertIn('tty >/dev/null', helper)
-        self.assertIn('exec /sbin/openrc-init', helper)
-        self.assertIn('exec /sbin/init', helper)
+        self.assertIn('[ "$init_command" = /sbin/openrc-init ]', helper)
+        self.assertEqual(2, helper.count('exec "$init_command"'))
         self.assertIn('exec script -q -e', helper)
-        self.assertIn('[ -x /usr/lib/systemd/systemd ]', helper)
+        self.assertIn('for candidate in /sbin/openrc-init /usr/lib/systemd/systemd /lib/systemd/systemd', helper)
         self.assertLess(helper.index('for tool in unshare mount mountpoint script'),
                         helper.index('exec unshare'))
         self.assertNotIn('StandardInput=tty-force', helper)
         self.assertIn('for node in kmsg fuse', prepare)
+        self.assertLess(prepare.index('test "$$" = 1'), prepare.index('umask 022'))
+        self.assertLess(prepare.index('umask 022'), prepare.index('mkdir'))
         for persistent in ('/var', '/etc/runlevels', '/etc/rancher', '/var/lib/rancher'):
             self.assertNotIn('tmpfs ' + persistent + '\n', helper)
         subprocess.run(['sh', '-n'], input=helper, text=True, check=True)
         self.assertLess(setup.index('\ninstall_init_session\n'), setup.index('\ngui_services=no'))
+
+    def test_init_session_selects_installed_init_without_sysv_alias(self):
+        helper = self.run_script('--print-init-session').stdout
+        selection = helper[helper.index('init_command=\n'):
+                           helper.index('if [ "${1:-}" != --namespace-init ]')]
+        paths = ('/sbin/openrc-init', '/usr/lib/systemd/systemd', '/lib/systemd/systemd',
+                 '/nix/var/nix/profiles/system/systemd/lib/systemd/systemd', '/sbin/init')
+        for mask in range(1 << len(paths)):
+            with self.subTest(mask=mask):
+                root = self.directory / ('init-' + str(mask))
+                script = re.sub('|'.join(map(re.escape, paths)),
+                                lambda match: str(root / match.group().lstrip('/')), selection)
+                expected = None
+                for index, path in enumerate(paths):
+                    target = root / path.lstrip('/')
+                    if mask & (1 << index):
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text('#!/bin/sh\nexit 0\n')
+                        target.chmod(0o755)
+                        if expected is None and index < 4:
+                            expected = str(target)
+                result = subprocess.run(['sh', '-eu', '-c', script + '\nprintf "%s" "$init_command"'],
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(0 if expected else 1, result.returncode, result.stderr)
+                self.assertEqual(expected or '', result.stdout)
+                if expected is None:
+                    self.assertIn('Install systemd or OpenRC', result.stderr)
+
+    def test_init_session_activates_installed_nixos_after_private_mounts(self):
+        helper = self.run_script('--print-init-session').stdout
+        prepare = self.run_script('--print-init-prepare').stdout
+        activation = '/nix/var/nix/profiles/system/activate'
+        self.assertLess(prepare.index('mount -t tmpfs -o mode=755 tmpfs /run'),
+                        prepare.index(activation))
+        self.assertLess(helper.index(activation), helper.index('mkdir -p /run/systemd/system/default.target.wants'))
+        self.assertIn(':/nix/var/nix/profiles/system/sw/bin', prepare)
+        self.assertNotIn('nixos-rebuild', helper)
+        module = self.run_script('--print-nixos-module').stdout
+        self.assertIn('${./magicdesk-files/magicdesk-init}', module)
+        self.assertIn('[ init bashInteractive', module)
+        self.assertIn(helper, self.run_script('--print-nixos-setup').stdout)
 
     def test_init_session_preserves_command_arguments(self):
         helper = self.run_script('--print-init-session').stdout
@@ -551,6 +595,114 @@ if os.environ.get("TEST_FAIL") == stage and "MAGICDESK_BUILD_PHASE=dependencies"
                                 text=True, capture_output=True, check=True)
         command = result.stdout.removeprefix('#!/bin/sh\n').removesuffix('\n')
         self.assertEqual(['exec', *arguments], shlex.split(command))
+
+    def test_init_session_restarts_only_the_default_login_console(self):
+        helper = self.run_script('--print-init-session').stdout
+        policy = helper[helper.index('console_restart=no\n'):
+                        helper.index("{\n    printf '#!/bin/sh\\nexec'")]
+        service = helper[helper.index("    {\n        printf '#!/sbin/openrc-run"):
+                         helper.index('    chmod 755 /etc/init.d/magicdesk-session')]
+        unit = helper[helper.index('cat > /run/systemd/system/magicdesk-session.service'):
+                      helper.index('ln -s ../magicdesk-session.service')]
+        service_path = self.directory / 'session.openrc'
+        unit_path = self.directory / 'session.service'
+        service = service.replace('/etc/init.d/magicdesk-session', str(service_path))
+        unit = unit.replace('/run/systemd/system/magicdesk-session.service', str(unit_path))
+        for arguments in ([], ['/bin/true'], ['/bin/false'], ['/bin/sh', '-l']):
+            with self.subTest(arguments=arguments):
+                subprocess.run(['sh', '-ec', policy + service + unit, 'fixture', *arguments],
+                               check=True, timeout=5)
+                openrc, systemd = service_path.read_text(), unit_path.read_text()
+                self.assertEqual(not arguments, 'supervisor=supervise-daemon' in openrc)
+                self.assertEqual(bool(arguments), 'command_background=yes' in openrc)
+                self.assertIn('Restart=' + ('no' if arguments else 'always'), systemd)
+                self.assertIn('Environment="PATH=' + os.environ['PATH'] + '"', systemd)
+                self.assertIn('command=$(command -v script)', openrc)
+                self.assertIn("-c 'exec /bin/sh /run/magicdesk-init-session'", openrc)
+                subprocess.run(['sh', '-n', str(service_path)], check=True, timeout=5)
+
+    def test_init_prepares_recovery_configuration_before_loading_units(self):
+        prepare = self.run_script('--print-init-prepare').stdout
+        helper = self.run_script('--print-init-session').stdout
+        start = prepare.index('if [ -f /usr/lib/initcpio/hooks/etc_overlay ]')
+        fragment = prepare[start:prepare.index("# Libvirt's host-wide AIO tuning")]
+        self.assertLess(helper.index(fragment), helper.index('exec "$init_command"'))
+        root = self.directory / 'recovery-init'
+        root.mkdir()
+        hook = root / 'etc_overlay'
+        marker = root / 'mounted'
+        calls = root / 'mounts'
+        fragment = fragment.replace('/usr/lib/initcpio/hooks/etc_overlay', str(hook))
+        fragment = fragment.replace('/var/lib/overlays/etc', str(root / 'overlay'))
+        fragment = fragment.replace('/run/md-init-resolver.', str(root / 'resolver.'))
+        functions = ('mountpoint() { if [ "$2" = /etc ]; then test -e "$MARKER"; '
+                     'else test "$RESOLVER" = yes; fi; }\n'
+                     'mount() { printf "%s\\n" "$*" >> "$CALLS"; }\n')
+        env = {**os.environ, 'MARKER': str(marker), 'CALLS': str(calls)}
+        for present, mounted, resolver, expected in ((False, False, False, False),
+                (True, False, False, True), (True, False, True, True), (True, True, True, False)):
+            with self.subTest(present=present, mounted=mounted, resolver=resolver):
+                if present:
+                    hook.touch()
+                if mounted:
+                    marker.touch()
+                calls.unlink(missing_ok=True)
+                subprocess.run(['sh', '-eu', '-c', functions + fragment],
+                               env=dict(env, RESOLVER='yes' if resolver else 'no'), check=True, timeout=5)
+                self.assertEqual(expected, calls.exists())
+                if expected:
+                    self.assertTrue((root / 'overlay/upper').is_dir())
+                    self.assertTrue((root / 'overlay/work').is_dir())
+                    self.assertIn('lowerdir=/etc,upperdir=', calls.read_text())
+                    actions = calls.read_text().splitlines()
+                    if resolver:
+                        self.assertEqual(3, len(actions))
+                        saved = actions[0].removeprefix('--move /etc/resolv.conf ')
+                        self.assertEqual('--move ' + saved + ' /etc/resolv.conf', actions[-1])
+                        self.assertFalse(Path(saved).exists())
+                        self.assertTrue(actions[1].endswith(' overlay /etc'))
+                    else:
+                        self.assertEqual(1, len(actions))
+                        self.assertTrue(actions[0].endswith(' overlay /etc'))
+
+    def test_init_preserves_launch_uplink_with_overridable_runtime_profile(self):
+        prepare = self.run_script('--print-init-prepare').stdout
+        fragment = prepare[prepare.index('# The launch configures eth0'):]
+        directory = self.directory / 'network'
+        fragment = fragment.replace('/run/systemd/network', str(directory))
+        subprocess.run(['sh', '-eu', '-c', fragment], check=True, timeout=5)
+        profile, = directory.iterdir()
+        self.assertEqual('80-magicdesk-uplink.network', profile.name)
+        config = configparser.ConfigParser()
+        config.read(profile)
+        self.assertEqual({'name': 'eth0'}, dict(config['Match']))
+        self.assertEqual({'dhcp': 'no', 'ipv6acceptra': 'no',
+                          'linklocaladdressing': 'no', 'keepconfiguration': 'static'},
+                         dict(config['Network']))
+        self.assertNotIn('/etc/systemd/network', fragment)
+
+    def test_init_makes_only_host_libvirt_aio_tuning_optional(self):
+        prepare = self.run_script('--print-init-prepare').stdout
+        fragment = prepare[prepare.index("# Libvirt's host-wide AIO tuning"):
+                           prepare.index('# The launch configures eth0')]
+        root = self.directory / 'sysctl-policy'
+        fragment = re.sub(r'/(?:usr/local/lib|usr/lib|lib|run)/sysctl\.d',
+                          lambda match: str(root) + match[0], fragment)
+        source = root / 'usr/lib/sysctl.d/60-libvirtd.conf'
+        source.parent.mkdir(parents=True)
+        original = '# Vendor tuning\n fs.aio-max-nr = 1048576\nfs/aio-max-nr=2097152\n' \
+                   '-fs.aio-max-nr = 8\nfs.aio-nr = 9\nnet.ipv4.ip_forward = 1\n'
+        source.write_text(original)
+        administrator = root / 'etc/sysctl.d/60-libvirtd.conf'
+        administrator.parent.mkdir(parents=True)
+        administrator.write_text('fs.aio-max-nr = 4096\n')
+        output = root / 'run/sysctl.d/60-libvirtd.conf'
+        for _ in range(2):
+            subprocess.run(['sh', '-eu', '-c', fragment], check=True, timeout=5)
+            self.assertEqual(original.replace(' fs.aio', '-fs.aio').replace('\nfs/aio', '\n-fs/aio'),
+                             output.read_text())
+            self.assertEqual(original, source.read_text())
+            self.assertEqual('fs.aio-max-nr = 4096\n', administrator.read_text())
 
     def test_arch_mirror_fallback_preserves_custom_lists_and_is_idempotent(self):
         setup = self.run_script('--print-system-setup').stdout
@@ -699,7 +851,7 @@ if os.environ.get("TEST_FAIL") == stage and "MAGICDESK_BUILD_PHASE=dependencies"
         result = self.run_script('--print-system-setup')
         self.assertEqual(0, result.returncode, result.stderr)
         setup = result.stdout
-        self.assertRegex(setup, r'dnf\) packages [^\n]* iptables-nft ;;')
+        self.assertRegex(setup, r'dnf\)\s+packages [^\n]* iptables-nft\n')
         selection = 'alternatives --set iptables /usr/bin/iptables-nft'
         self.assertGreater(setup.index(selection), setup.index('packages $extras'))
 
@@ -785,6 +937,47 @@ if os.environ.get("TEST_FAIL") == stage and "MAGICDESK_BUILD_PHASE=dependencies"
         self.assertEqual('/dev/null', os.readlink(output / 'proc-sys-fs-binfmt_misc.automount'))
         self.assertFalse((output / 'systemd-binfmt.service').exists())
         self.assertFalse((output / 'proc-sys-fs-binfmt_misc.mount').exists())
+
+    def test_rpm_setup_restores_package_declared_helper_capabilities(self):
+        setup = self.run_script('--print-system-setup').stdout
+        start = setup.index('case "$family" in', setup.index('setup_locked=no'))
+        fragment = setup[start:setup.index('\nesac', start) + len('\nesac')]
+        for family, package in (('dnf', 'shadow-utils'), ('zypper', 'shadow')):
+            for status in (0, 23):
+                with self.subTest(family=family, status=status):
+                    script = f'''family={family}
+packages() {{ printf 'packages %s\\n' "$*"; }}
+refresh_packages() {{ :; }}
+rpm() {{ printf 'rpm %s\\n' "$*"; return {status}; }}
+chmod() {{ exit 99; }}
+''' + fragment
+                    result = subprocess.run(['sh', '-eu', '-c', script], capture_output=True,
+                                            text=True, timeout=5)
+                    self.assertEqual(status, result.returncode, result.stderr)
+                    lines = result.stdout.splitlines()
+                    self.assertIn(package, lines[0].split())
+                    self.assertEqual('rpm --setcaps ' + package, lines[1])
+                    self.assertEqual(2, len(lines))
+
+    def test_pacman_setup_restores_package_declared_helper_capabilities(self):
+        setup = self.run_script('--print-system-setup').stdout
+        start = setup.index('case "$family" in', setup.index('setup_locked=no'))
+        fragment = setup[start:setup.index('\nesac', start) + len('\nesac')]
+        for status in (0, 23):
+            with self.subTest(status=status):
+                script = f'''family=pacman
+arch_mirror_fallback() {{ :; }}
+refresh_packages() {{ :; }}
+packages() {{ printf 'packages %s\\n' "$*"; }}
+pacman() {{ printf 'pacman %s\\n' "$*"; return {status}; }}
+chmod() {{ exit 99; }}
+setcap() {{ exit 99; }}
+''' + fragment
+                result = subprocess.run(['sh', '-eu', '-c', script], capture_output=True,
+                                        text=True, timeout=5)
+                self.assertEqual(status, result.returncode, result.stderr)
+                self.assertEqual(['packages ca-certificates bash coreutils util-linux tzdata gzip',
+                                  'pacman -S --noconfirm shadow'], result.stdout.splitlines())
 
     def test_pacman_keeps_installed_dependency_providers(self):
         setup = self.run_script('--print-system-setup').stdout
@@ -1911,7 +2104,9 @@ packages ninja meson pkgconf
         self.assertIn('sandbox = true;', script)
         self.assertNotIn('export NIX_CONFIG=', script)
         self.assertIn('patchShebangs --build .', script)
-        self.assertEqual(1, script.count('unshare --mount'))
+        init_helper = self.run_script('--print-init-session').stdout.strip()
+        self.assertEqual(1, script.count(init_helper))
+        self.assertEqual(1, script.replace(init_helper, '', 1).count('unshare --mount'))
         self.assertIn('"$system/sw/bin/bash" -s -- "$system" "$@"', script)
         pts = script.index('mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts')
         activate = script.index('\n/run/current-system/activate\n')
@@ -2284,9 +2479,11 @@ packages ninja meson pkgconf
                 self.assertNotEqual(0, self.run_script("--yes", *args).returncode)
                 self.assertEqual([], self.calls())
 
-    def test_regular_app_uid_is_rejected_without_elevation(self):
-        self.assertNotEqual(0, self.run_script("--yes", TEST_UID="10001").returncode)
-        self.assertEqual([], self.calls())
+    def test_app_uid_uses_same_capability_probe_and_recipe_without_elevation(self):
+        result = self.run_script("--yes", TEST_UID="10001")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["--probe"], self.calls()[0])
+        self.assertIn("Linux is ready", result.stdout)
 
     def test_noninteractive_stdin_requires_explicit_consent(self):
         result = self.run_script()

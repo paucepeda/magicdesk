@@ -8,7 +8,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-static int listener=-1, install_error, valid_error, interrupted, expired, sends, installs, released;
+static int listener=-1, install_error, valid_error, send_error, interrupted, expired, sends, installs, released;
 int __real_ioctl(int,unsigned long,...);
 int __wrap_ioctl(int fd,unsigned long request,...) {
     va_list args; va_start(args,request);
@@ -26,6 +26,7 @@ int __wrap_ioctl(int fd,unsigned long request,...) {
         errno=install_error; return install_error ? -1 : 42;
     }
     assert(request==SECCOMP_IOCTL_NOTIF_SEND);
+    if (send_error) { ++sends; errno=send_error; return -1; }
     ++sends; errno=ENOENT; return expired ? -1 : 0;
 }
 static void release(struct md_fd_object *object) { (void)object; ++released; }
@@ -57,9 +58,17 @@ void md_test_notification_result(void) {
     interrupted=1;
     assert(!md_notification_rebind(listener,&pending,&next) && pending.id==18 && !sends && !installs);
     assert(!interrupted);
+    const int errors[]={0,ENOENT,EINPROGRESS,EBADF};
+    for (unsigned i=0;i<sizeof(errors)/sizeof(*errors);++i) {
+        expired=0; send_error=errors[i];
+        assert(md_notification_retire(listener,19,123)==(i==0 ? 1 : i==3 ? -EBADF : 0));
+    }
+    assert(sends==4 && !installs); sends=0; send_error=0;
     expired=0;
     struct md_notification_result result={0};
+    assert(!md_notification_result_queued(&result));
     assert(!md_notification_result_fd(&result,&call,files,source,&origin,O_CLOEXEC));
+    assert(!md_notification_result_queued(&result));
     assert(md_notification_result_matches(&result,&call));
     for (unsigned i=0;i<6;++i) {
         call.args[i]^=1; assert(!md_notification_result_matches(&result,&call)); call.args[i]^=1;
@@ -69,6 +78,7 @@ void md_test_notification_result(void) {
     assert(!result.delivered && result.source==source && !sends);
     install_error=0; expired=0;
     assert(md_notification_result_offer(&result,listener,2,NULL)==MD_NOTIFICATION_DELIVERED);
+    assert(!md_notification_result_queued(&result));
     assert(result.value==42 && installs==2 && !sends);
     struct md_fd_object *published=md_fd_origins_object(files,42,NULL);
     assert(published==&origin); md_fd_object_release(published);
@@ -92,11 +102,15 @@ void md_test_notification_result(void) {
     assert(!md_notification_result_fd(&result,&call,files,source,&origin,0));
     install_error=0;
     assert(md_notification_result_offer(&result,listener,5,NULL)==MD_NOTIFICATION_WAIT);
+    assert(md_notification_result_queued(&result));
     expired=1;
     assert(md_notification_result_progress(&result)==MD_NOTIFICATION_CANCELLED);
+    assert(!md_notification_result_queued(&result));
     expired=0;
     assert(md_notification_result_offer(&result,listener,6,NULL)==MD_NOTIFICATION_WAIT);
+    assert(md_notification_result_queued(&result));
     assert(!md_notification_result_clear(&result) && !md_fd_order_complete(&busy));
+    assert(!md_notification_result_queued(&result));
     assert(installs==3 && sends==2 && !released && fcntl(source,F_GETFD)>=0);
     assert(!md_notification_result_status(&result,&call,-ENOENT));
     expired=1;

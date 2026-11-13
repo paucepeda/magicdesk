@@ -26,7 +26,8 @@ void md_boot(uintptr_t *stack) {
     if (argc < 5)
         md_die("usage: guest-run --store HOST_PATH [--cwd GUEST_PATH] -- PROGRAM [ARGS]", -EINVAL);
     const char *store = NULL, *cwd = "/", *home = "/tmp", *admit = NULL, *run_deadline = NULL;
-    int diagnostics = 0, statistics = 0, commands = 0;
+    const char *diagnostics = NULL;
+    int statistics = 0, commands = 0;
     const char *user = NULL;
     const char *groups = NULL;
     const char *hostname = NULL;
@@ -36,7 +37,9 @@ void md_boot(uintptr_t *stack) {
     struct md_fs_attachment attachments[MD_FS_MOUNTS_MAX]; unsigned attachment_count = 0;
     size_t program = 1;
     while (program < argc && !md_equal(argv[program], "--")) {
-        if (md_equal(argv[program], "--diagnostics")) { diagnostics = 1; program++; continue; }
+        if (md_equal(argv[program], "--diagnostics") || md_equal(argv[program], "--diagnostics=signals")) {
+            diagnostics = argv[program++]; continue;
+        }
         if (md_equal(argv[program], "--statistics")) { statistics = 1; program++; continue; }
         if (md_equal(argv[program], "--magicdesk") && !commands) { commands = 1; program++; continue; }
         if (program + 1 >= argc) md_die("missing launch option value", -EINVAL);
@@ -87,6 +90,9 @@ void md_boot(uintptr_t *stack) {
     if (groups && !user) md_die("guest groups require an explicit guest user", -EINVAL);
     int network_error=md_network_profile_validate(&network);
     if (network_error) md_die("incompatible network options",network_error);
+    const char *runtime_tmp=store;
+    for (unsigned i=0;env[i];++i)
+        if (md_prefix(env[i],"TMPDIR=/")) { runtime_tmp=env[i]+7; break; }
     struct md_launch_environment guest_environment;
     long environment_result = md_launch_environment(&guest_environment, home, env);
     if (environment_result < 0) md_die("guest environment", environment_result);
@@ -128,16 +134,17 @@ void md_boot(uintptr_t *stack) {
     if (!guard) {
         struct md_arguments arguments;
         md_arguments_init(&arguments);
-        long error=md_arguments_reserve(&arguments,argc-program+32+3*(md_connections.count+attachment_count)
+        long error=md_arguments_reserve(&arguments,argc-program+34+3*(md_connections.count+attachment_count)
             +md_network_profile_arguments(&network,NULL));
         if (error<0) md_die("launch arguments",error);
         char **args=arguments.values;
         args[0]=supervisor;
         unsigned n = 1;
-        if (diagnostics) args[n++] = "--diagnostics";
+        if (diagnostics) args[n++] = (char *)diagnostics;
         if (statistics) args[n++] = "--statistics";
         if (commands) args[n++] = "--magicdesk";
         if (run_deadline) { args[n++] = "--deadline-seconds"; args[n++] = (char *)run_deadline; }
+        args[n++]="--runtime-tmp"; args[n++]=(char *)runtime_tmp;
         if (admit) { args[n++] = "--admit-elf"; args[n++] = (char *)admit; }
         if (user) { args[n++] = "--user"; args[n++] = (char *)user; }
         if (groups) { args[n++] = "--groups"; args[n++] = (char *)groups; }

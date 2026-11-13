@@ -119,7 +119,14 @@ class ClientTest(unittest.TestCase):
                     if name == "wait_for_state":
                         assert args["timeoutMillis"] == 30000
                         return {"matched": True}
+                    if name == "console.open":
+                        return {"sessionId": "update-console"}
+                    if name == "console.execute":
+                        return {"exitCode": 0, "output": "/selected/runtime/cache/tmp"}
+                    if name == "console.close":
+                        return {}
                     if name == "files.upload_begin":
+                        assert args["path"] == "/selected/runtime/cache/tmp/update-update1234567890.apk"
                         return {"state": "completed", "path": "/apk"}
                     if name == "app.update":
                         raise ConnectionResetError("app replaced")
@@ -129,6 +136,35 @@ class ClientTest(unittest.TestCase):
             self.assertTrue(result["processChanged"])
             self.assertEqual(1, calls.count("app.update"))
             self.assertNotIn("close_desktop", calls)
+
+    def test_update_waits_for_power_handoff_without_reinstalling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            apk = pathlib.Path(directory) / "app.apk"
+            apk.write_bytes(b"apk")
+            for outcome in ("restored", "failed"):
+                with self.subTest(outcome=outcome):
+                    calls = []
+
+                    class Fake:
+                        timeout = 2
+
+                        def call(self, name, args=None, **kwargs):
+                            calls.append(name)
+                            if name == "get_state":
+                                return {"app": {"versionCode": 2, "instanceId": "new"}, "workspaces": []}
+                            if name == "app.update_status":
+                                return {"state": "installed", "versionCode": 2, "sha256": mcp.digest(apk),
+                                        "powerRestore": "pending" if calls.count(name) <= 2 else outcome}
+                            raise AssertionError(name)
+
+                    if outcome == "failed":
+                        with self.assertRaisesRegex(mcp.ToolError, "APK installed, but phone power restoration failed"):
+                            mcp.update(Fake(), apk, "update1234567890")
+                    else:
+                        result = mcp.update(Fake(), apk, "update1234567890")
+                        self.assertEqual("restored", result["update"]["powerRestore"])
+                    self.assertNotIn("app.update", calls)
+                    self.assertEqual(3, calls.count("app.update_status"))
 
     def test_unknown_completion_never_repeats_an_accepted_update(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -195,6 +231,12 @@ class ClientTest(unittest.TestCase):
                             if name == "files.upload_begin":
                                 assert self.pending is None and not self.remaining
                                 return {"state": "completed", "path": "/apk"}
+                            if name == "console.open":
+                                return {"sessionId": "update-console"}
+                            if name == "console.execute":
+                                return {"exitCode": 0, "output": "/selected/runtime/cache/tmp"}
+                            if name == "console.close":
+                                return {}
                             if name == "app.update":
                                 assert self.pending is None and not self.remaining
                                 self.installed = True

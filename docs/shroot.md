@@ -1,7 +1,8 @@
 # Shroot
 
-Shroot runs ARM64 Linux userspace through MagicDesk's explicitly selected shell
-or root executor. The unrooted path uses Android's authorized shell UID 2000.
+Shroot runs ARM64 Linux userspace through MagicDesk's explicitly selected
+User (app UID) or Shell executor (normally UID 2000). User needs no Shizuku or
+root; Shell uses the configured privileged service and may run as UID 0.
 It needs neither Termux, PRoot, a virtual machine nor a replacement Android
 kernel. glibc and musl distributions, applications, init systems and container
 engines use the same runtime.
@@ -21,8 +22,8 @@ describes how those contracts are tested.
 
 ## Requirements
 
-- MagicDesk on Android 14+ and an authorized shell/root service. Shizuku or
-  Shevery supplies shell access without Android root. Managed Desktop is
+- MagicDesk on Android 14+. Shell execution additionally requires an authorized
+  service; Shizuku or Shevery supplies it without Android root. Managed Desktop is
   optional and has its own Android 15+ requirement.
 - Linux 5.15+ with the required operations permitted under the selected executor.
   Kernel version, Android version and build success alone do not establish this.
@@ -69,7 +70,9 @@ stop another launch. Persistent stores outlive those processes.
 | --- | --- | --- |
 | Filesystems | Guest roots, mount views, DAC/ACL permissions, read-only/no-exec policy, Landlock filesystem rules | Unadapted calls and retained host descriptors are not fully confined |
 | Processes | Launch-scoped signals with guest credential checks, nested PID views, proc visibility, translated waits and guest PID 1 lifetime | Not a host kernel PID namespace |
+| Robust mutexes | Owner-death cleanup and waiter wakeup under User and logical PID namespaces, including exit, SIGKILL and exec; ordinary futex IO remains native | Shell outside PID namespaces retains native kernel behavior; no emulated priority inheritance |
 | Credentials | Guest users, groups, capabilities, drops and namespace ownership | Guest root never grants Android root or kernel capabilities |
+| Dumpability | Guest prctl state, mm sharing, exec reset and guest process-inspection checks | Native tasks remain dumpable for runtime access; no Android isolation or guest core-dump service |
 | IPC and terminals | Separate SysV IPC owners, store-scoped pathname sockets, private devpts views | Inherited connections retain authority; explicit abstract Unix sockets share the host namespace |
 | Network | Offline child namespaces or routed IPv4/IPv6, private ports, supported nftables flow filtering and NAT | Native backing ports remain reachable; not a host firewall or full Linux network isolation |
 | Resource controls | Launch-local real-UID `RLIMIT_NPROC`; logical `RLIMIT_NOFILE` backed by native FD allocation; hierarchical cgroup `pids.max`, membership, freezer and sampled CPU/RSS counters | Android's physical FD/task budgets still apply; cgroup CPU, cpuset, memory and device policies are not enforced; sampled RSS is not kernel page charging; other resource limits remain native |
@@ -98,12 +101,17 @@ than scanning every executable byte as if it were an instruction.
 
 For an eligible site, Shroot prepares a private entry stub and replaces that
 single `svc` instruction in process memory with a branch. Publication does not
-stop neighboring threads. The stub checks the syscall number and routes the
-call to the shared syscall engine; later calls at that site can avoid the
+stop neighboring threads. Publication happens on the first suitable intercepted
+execution; the stub chooses an operation on each invocation rather than only
+admitting a fixed fast-call list. It routes the call to the shared syscall engine;
+later calls at that site can avoid the
 seccomp/ptrace round trip. Eligible native operations execute in the guest
-thread, while worker-owned operations use the shared-memory channel. The
-kernel still performs native IO: acceleration does not mean that every syscall
-becomes a purely userspace operation.
+thread, while worker-owned operations use the shared-memory channel. Admitted
+task-affine operations use that same channel and the common C executor, retaining
+the existing supervisor resource owners. Completion and cancellation preserve
+already performed effects; a required kernel continuation does not restart the
+original operation. The kernel still performs native IO: acceleration does not
+mean that every syscall becomes a purely userspace operation.
 
 This works with unmodified stock glibc, musl, static executables and Go binaries.
 Package-owned files on disk are unchanged. Mapping changes invalidate affected
@@ -123,9 +131,18 @@ lazy entry explicitly. This is a process environment setting, not a persistent
 distribution setting; programs that replace their environment must retain it
 when a Base-only comparison is intended. Already running processes are unchanged.
 
-Application seccomp filters revoke accelerated entry and retain kernel admission.
-Protected processes and debugger ownership also use the common fallback rules.
-A successful sandboxed launch therefore does not prove an unfiltered speedup.
+Application seccomp installation fences accelerated calls before publishing an
+immutable policy view. Eligible calls can then retain lazy entry: the shared
+interpreter checks the original syscall arguments and instruction address before
+any effect. ALLOW uses the existing engine, ERRNO returns directly, and other
+actions retain original-site kernel admission. An admitted service syscall uses
+an owned entry ahead of the kernel's guest-policy mirror, avoiding a second
+execution of that policy. Cold calls and unproven inherited entries retain the
+kernel fallback. Android's own filters still apply. IP-independent filter chains can
+retain acceleration after exec when they admit an inert return checkpoint.
+IP-sensitive inherited chains, unavailable policy mappings and debugger ownership
+retain Base. A successful sandboxed launch alone therefore does not prove
+acceleration.
 See [entry contracts](../native/shroot/cooperative-entry.md#sandboxes-and-debuggers)
 and [integration evidence](../native/guest-exec-lab/svc-rewriting.md#product-boundary).
 Native `--statistics` reports `SVC_RUNTIME_STATS` and completed calls; ordinary
@@ -146,9 +163,9 @@ docker run --rm -it --platform linux/arm64 alpine:3.23 sh
 
 The container's programs use the same entry admission as other guest processes,
 including after package updates. This also applies to nested Podman processes.
-Keep the engine's normal seccomp policy: when it installs a filter, the container
-uses Base admission. Do not disable that policy merely to claim a higher
-benchmark result.
+Keep the engine's normal seccomp policy. Calls retain their policy checks;
+eligible inherited filters retain lazy entry after exec; others use Base. Do not
+disable that policy merely to claim a higher benchmark result.
 
 For reproducible comparisons, pin the image digest and retain identical mounts,
 sandbox policy and storage. Report actual entry completions separately from
@@ -159,7 +176,7 @@ elapsed time; loaded-library listings are not an acceleration measurement.
 [`scripts/install_linux.sh`](../scripts/install_linux.sh) installs ARM64 Linux
 through the same named-environment manager. Run it in
 [MagicDesk Console](getting-started.md#open-the-android-shell-console)
-with shell or root access. Termux and managed Desktop are not required.
+with **User** or **Shell** selected. Termux and managed Desktop are not required.
 Download the file before running it so terminal input remains available for
 the questions:
 
@@ -170,8 +187,15 @@ sh ~/install_linux.sh
 
 This is the maintained download address. The installer can be updated without
 replacing the APK; download again to atomically replace `~/install_linux.sh`.
-UID 2000's shell home is `/data/local/tmp/magicdesk/`; root consoles use
-`/data/local/tmp/magicdesk-root/home`. Release tags retain the installer matching
+User's home is MagicDesk's private app data directory. Shell UID 2000 uses
+`/data/local/tmp/magicdesk/`; Shell with UID 0 uses
+`/data/local/tmp/magicdesk/root`. Each stores installations in `~/linux`.
+The installer and `--resume` operate only in their console's library, without
+switching executor or converting storage. The Linux picker labels entries
+`Alpine (User)` or `Debian (Shell)`; Shell keeps that name even with root access.
+Both executors use managed Shroot format 17. Root authority alone does not
+select native chroot/mount behavior or a different storage format.
+Release tags retain the installer matching
 that release.
 The current installer requires MagicDesk 2.2.5 or newer (`versionCode` 232),
 which supplies the completion-owned DMA-BUF consumer required by its Turnip
@@ -343,7 +367,7 @@ The installer does not run a background network monitor or overwrite later edits
 #### Resume An Interrupted Installation
 
 In [MagicDesk Console](getting-started.md#open-the-android-shell-console),
-using the same shell/root executor as before:
+using the same executor as before:
 
 ```sh
 shroot list
@@ -699,7 +723,7 @@ shroot remove tools
 shroot prune
 ```
 
-The named-environment manager uses the selected shell executor. It needs neither
+The named-environment manager uses the selected User or Shell executor. It needs neither
 Termux, Python, an external download tool nor a Docker daemon. Image import
 does not execute package scripts. The installer above is the separate step
 that configures packages and GUI services.
@@ -719,11 +743,17 @@ Instances copy up on mutation. `path NAME` returns the immutable store location;
 Reusing a removed name creates a new identity, never retargets a running launch
 or an existing shortcut.
 
-The default library is `$MAGICDESK_RUNTIME/guest-environments`;
+The default library is `$HOME/linux`;
 `MAGICDESK_GUEST_HOME` selects another executor-accessible executable filesystem.
 Do not edit its backing files as a normal rootfs: names, hardlinks, metadata and
 shared image ownership belong to the inode store. Use guest commands, explicit
 attachments or backup/restore.
+
+Shared-source references are relative to each store, so an inactive library can
+move as one tree on the same filesystem without copying file bodies. Source
+device/inode checks and live leases remain enforced. The default library layout
+is adopted offline; a running store blocks relocation. For another filesystem,
+device or executor UID, use backup/restore instead of copying backing directories.
 
 Eligible private regular files use native names by default, with sparse metadata
 for non-root ownership. Creation, rename and deletion avoid per-file SQLite
@@ -946,8 +976,16 @@ the selected executor's identity, or other terminals' login policy. Installed
 services, `/etc` and `/var/lib` persist; `/run`, `/tmp` and `/dev` belong to this
 boot. Only boot an idle environment: independent launches do not share its
 service manager or runtime mounts. `magicdesk-init COMMAND ARG...` runs that
-command as the console service instead of the login shell. `exec` replaces the
+command once as the console service instead of the automatically restarted
+login shell; command failure does not trigger a retry. `exec` replaces the
 calling shell so that shutdown also ends that Shroot launch.
+
+For systemd-networkd, the helper publishes
+`/run/systemd/network/80-magicdesk-uplink.network`: it retains the launch's
+static `eth0` addresses and routes without requesting DHCP. Other links keep
+their normal configuration. To manage that uplink yourself, use an earlier
+matching `.network` file or the same filename in `/etc/systemd/network`, following
+[networkd's configuration precedence](https://www.freedesktop.org/software/systemd/man/latest/systemd.network.html).
 
 Install missing init packages before boot (`systemd-sysv` and `dbus` on Debian;
 `openrc` on Alpine). The helper also uses util-linux, supplied by the recipe.
@@ -1267,7 +1305,7 @@ IP/name lookup, outbound DNS/HTTP, port conflicts and shutdown pass without
 Android root. This is separate from guest-root Docker and does not certify
 every RootlessKit driver or cgroup delegation setup.
 
-For both engines, guest root is still real Android UID 2000. Enabled cgroups
+For both engines, guest root retains the selected Android executor's actual UID. Enabled cgroups
 provide membership, freezer state, enforced hierarchical PID limits and sampled
 CPU/RSS counters. CPU quotas, cpuset affinity, memory and device limits remain
 unenforced; these are not full kernel resource controls.
@@ -1532,7 +1570,9 @@ MagicDesk ships no D-Bus daemon and does not reuse Android's or Termux's bus.
 ## Coverage And Limits
 
 The device baseline for these results is RM11/NX809J, Android API 36,
-Linux 6.12.23, 4 KiB pages and actual UID 2000. The minimum supported kernel
+Linux 6.12.23 and 4 KiB pages. Shell results use actual UID 2000; separate
+[User-mode evidence](../native/guest-exec-lab/host-execution.md) records app-UID
+coverage, including stock glibc/musl robust mutexes. The minimum supported kernel
 remains 5.15; build and injected-error checks are not device coverage for another
 kernel, firmware, page size or executor identity.
 

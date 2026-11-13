@@ -214,7 +214,8 @@ isolated behind these boundaries.
   `PlatformDriver` exposes only existing variation points.
   `PlatformWindowingDriver` owns optional provisioning properties;
   `PlatformProjectionDriver` owns output modes, wireless-launch integration,
-  and caption transport; `PlatformPhoneUiDriver` owns phone-screen power control;
+  and caption transport; the Android `PlatformPhoneUiDriver` exposes shared
+  phone-panel power capability through `PhoneDisplayGuard`;
   `PlatformPointerDriver` owns optional read-only cursor observation. On Nubia
   firmware this is implemented by `NubiaDesktopPointerDriver` over the hidden
   global position query. Physical input
@@ -320,10 +321,11 @@ isolated behind these boundaries.
   command to the currently registered host on the main thread. Self-tests may
   address that gateway directly when the gateway itself is the subject under
   test.
-- Platform phone-UI adapters receive the active desktop display ID with a
-  phone-screen request. They do not discover session state through
-  `DesktopRuntimeBridge` and publish state changes through the runtime rather
-  than reaching a desktop Activity.
+- `PhoneDisplayGuard` owns an independent serialized phone-power operation and
+  CPU work lease. Control Panel uses a phone-only owner; Desktop's external
+  controls may explicitly attach an additional application-protection lease to
+  their display. Only that display's close releases its associated power guard.
+  The common guard publishes state through the runtime, not a desktop Activity.
 - `ExternalDisplayController` discovers dynamic display IDs and fixes geometry.
 - `DisplayInputSession` owns input routing and the virtual phone pointer;
   `DesktopShortcutService` filters desktop shortcuts, and
@@ -343,8 +345,19 @@ desktop panels. Keep this split when adding vendor-specific behavior.
 ## Physical Input
 
 Hardware events travel through Android's physical devices and their explicit
-desktop display associations. Android owns repeat, modifiers, cursor motion,
-acceleration, hover, dragging and secondary-button semantics.
+display associations. Android owns repeat, modifiers, cursor motion,
+acceleration, hover, dragging, secondary-button semantics and multitouch.
+External touchscreens use the same `DisplayInputRoutingSession` and reversible
+`InputRoutingLease` as keyboards and mice, including hotplug and cleanup.
+Discovery joins EventHub nodes to InputReader's `TOUCH_SCREEN` classification
+by EventHub ID, not name or Android device ID. The EventHub `TOUCH` class alone
+also includes touchpads. Built-in panels, virtual touch devices and unclassified
+touch nodes are not selected. A touchscreen disabled by a missing viewport is
+still eligible for routing. The existing bounded input snapshot supplies this
+inventory and the report's touchscreen count; no per-event forwarding or new
+polling is involved. Hardware/firmware detection and usable input viewports
+remain prerequisites, and firmware-static routes are not overwritten.
+
 `DesktopShortcutService` consumes only MagicDesk shortcuts; each physical
 keyboard has its own `KeyboardShortcutStateMachine`. Consumed key-down/up
 pairs remain balanced across modifier release and repeated keys. Unplugging a

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Descriptor mount API and stock util-linux consumers, through actual shell."""
+"""Descriptor mount API and stock util-linux consumers in the selected executor."""
 import argparse
 import array
 import ctypes
@@ -8,6 +8,7 @@ import fcntl
 import os
 import select
 from pathlib import Path
+import signal
 import socket
 import struct
 import subprocess
@@ -107,6 +108,33 @@ def guest():
     def config(fd, key, value=None):
         return call(431, fd, 0 if value is None else 1, key, 0 if value is None else value, 0)
 
+    with tempfile.TemporaryDirectory(prefix='md-proc-mount-') as directory:
+        source, moved, target = (Path(directory) / name for name in ('source', 'moved', 'target'))
+        source.write_text('original')
+        target.touch()
+        descriptor = os.open(source, os.O_PATH | os.O_CLOEXEC)
+        try:
+            source.rename(moved)
+            source.write_text('replacement')
+            reference = f'/proc/self/fd/{descriptor}'
+            expected = os.fstat(descriptor)
+            assert os.stat(reference).st_ino == expected.st_ino
+            assert os.lstat(reference).st_mode & 0o170000 == 0o120000
+            call(56, -100, reference, os.O_PATH | os.O_DIRECTORY, 0, error=errno.ENOTDIR)
+            # The peer shares the table, but proc/self resolves its leader.
+            # Rename/replacement must not turn a captured dentry into a path.
+            with ThreadPoolExecutor(max_workers=1) as workers:
+                workers.submit(call, 40, reference, str(target), 0, 4096, 0).result(timeout=10)
+            try:
+                assert target.read_text() == 'original'
+                assert target.stat().st_ino == expected.st_ino
+            finally:
+                call(39, str(target), 2)
+        finally:
+            os.close(descriptor)
+        call(56, -100, reference, os.O_PATH, 0, error=errno.ENOENT)
+    print('PASS proc FD metadata and threaded bind retain the selected dentry', flush=True)
+
     # Exec closes the construction FD, but the running image must keep its
     # detached mount alive across later mount collection, including in a peer.
     image_check = '''
@@ -115,7 +143,7 @@ libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
 for _ in range(8):
     fd = libc.syscall(ctypes.c_long(428), ctypes.c_long(-100),
-                      ctypes.c_char_p(b'/usr/bin/true'), ctypes.c_long(1 | os.O_CLOEXEC))
+                      ctypes.c_char_p(b'/bin/sh'), ctypes.c_long(1 | os.O_CLOEXEC))
     assert fd >= 0, ctypes.get_errno()
     os.close(fd)
 with open('/proc/self/exe', 'rb') as image:
@@ -499,6 +527,48 @@ if sys.argv[-1] == '0':
         event.close()
         os.close(watched)
         print('PASS live mount table, epoll notification, reread and unmount', flush=True)
+
+        # libc does not silently retry EINTR as Python's file IO does. Internal
+        # table preparation must survive signals even without SA_RESTART.
+        libc.fopen.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        libc.fopen.restype = ctypes.c_void_p
+        libc.getline.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p]
+        libc.getline.restype = ctypes.c_ssize_t
+        for name in ('rewind', 'ferror', 'feof', 'fclose', 'free'):
+            getattr(libc, name).argtypes = [ctypes.c_void_p]
+        stream = libc.fopen(b'/proc/self/mountinfo', b're')
+        assert stream, ctypes.get_errno()
+        line, capacity = ctypes.c_void_p(), ctypes.c_size_t()
+        received = []
+        action = signal.signal(signal.SIGALRM, lambda *_: received.append(True))
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+        timer = signal.setitimer(signal.ITIMER_REAL, 0.0005, 0.0005)
+        mounted = False
+        try:
+            for _ in range(32):
+                call(40, 'tmpfs', str(root), 'tmpfs', 0, 0)
+                mounted = True
+                libc.rewind(stream)
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})
+                count = 0
+                while libc.getline(ctypes.byref(line), ctypes.byref(capacity), stream) >= 0:
+                    assert b' - ' in ctypes.string_at(line)
+                    count += 1
+                error = ctypes.get_errno()
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+                assert not libc.ferror(stream) and libc.feof(stream) and count, (error, count)
+                call(39, str(root), 2)
+                mounted = False
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, *timer)
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            signal.signal(signal.SIGALRM, action)
+            libc.free(line)
+            assert libc.fclose(stream) == 0
+            if mounted:
+                call(39, str(root), 2)
+        assert received, 'signal stress did not deliver any signal'
+        print('PASS libc mountinfo refresh under signals without SA_RESTART', flush=True)
 
         for table in ('/proc/mounts', '/proc/self/mountinfo'):
             paths = [root / ('ordered-' + str(i)) for i in range(3)]
@@ -981,6 +1051,56 @@ if sys.argv[-1] == '0':
         assert len(os.listdir('/proc/self/fd')) == before
         print('PASS open_tree: retained roots, recursive clones, native files, policy and cleanup', flush=True)
 
+        # The combined API must publish the same object with its policy already
+        # applied, without exposing a temporary unconfigured guest descriptor.
+        combined = (ctypes.c_uint64 * 5)(1 | 2, 0, 0, 0, 0)
+        address = ctypes.addressof(combined)
+        call(467, -100, str(source), 1, 0, 32, error=errno.EINVAL)
+        call(467, -100, str(source), 1, address, 31, error=errno.EINVAL)
+        call(467, -100, str(source), 1, 1, 32, error=errno.EFAULT)
+        combined[4] = 1
+        call(467, -100, str(source), 1, address, 40, error=errno.E2BIG)
+        combined[4] = 0
+        context = create()
+        child_mount = call(432, context, 1, 0)
+        os.close(context)
+        call(429, child_mount, '', -100, str(source / 'child'), 4)
+        os.close(child_mount)
+        (source / 'child' / 'value').write_text('child')
+        clone = call(467, -100, str(source), 1 | os.O_CLOEXEC | 0x8000, address, 40)
+        assert fcntl.fcntl(clone, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+        assert os.fstatvfs(clone).f_flag & 3 == 3
+        call(429, clone, '', -100, str(destination), 4)
+        os.close(clone)
+        for relative in ('value', 'child/value'):
+            write_denied(destination / relative)
+            (source / relative).write_text('source writable')
+            assert (destination / relative).read_text() == 'source writable'
+        combined[0] = 8
+        opened = call(467, -100, str(destination), os.O_CLOEXEC, address, 32)
+        assert os.statvfs(destination).f_flag & 11 == 11
+        assert os.fstatvfs(opened).f_flag & 11 == 11
+        combined[0], combined[1] = 0, 11
+        duplicate = call(467, opened, '', 0x1000, address, 32)
+        assert not os.fstatvfs(duplicate).f_flag & 11
+        os.close(duplicate)
+        os.close(opened)
+        combined[1] = 0
+        opened = call(467, -100, str(source / 'value'), 0, address, 32)
+        assert os.fstat(opened).st_ino == (source / 'value').stat().st_ino
+        os.close(opened)
+        opened = call(467, -100, str(source), 0, 0, 0)
+        os.close(opened)
+        before = len(os.listdir('/proc/self/fd'))
+        combined[0] = 1 << 63
+        for _ in range(16):
+            call(467, -100, str(source), 1 | os.O_CLOEXEC, address, 32, error=errno.EINVAL)
+        assert len(os.listdir('/proc/self/fd')) == before
+        assert not os.statvfs(source).f_flag & (os.ST_RDONLY | os.ST_NOSUID)
+        call(39, str(destination), 2)
+        call(39, str(source / 'child'), 2)
+        print('PASS open_tree_attr: atomic policy, recursive clone, attached FD, ABI validation and cleanup', flush=True)
+
         # openat2 shares the versioned-structure reader, not mount semantics.
         how = (ctypes.c_uint64 * 4)(os.O_PATH, 0, 0, 0)
         opened = call(437, -100, str(root), ctypes.addressof(how), ctypes.sizeof(how))
@@ -1065,20 +1185,23 @@ if sys.argv[-1] == '0':
 
 
 def main():
+    from fixture_executor import FixtureExecutor
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('build', type=Path)
     parser.add_argument('store')
     parser.add_argument('--base', action='store_true')
+    parser.add_argument('--output', type=Path)
+    FixtureExecutor.add_argument(parser)
     args = parser.parse_args()
     from test_oci_services import Suite
-    suite = Suite(args.build, args.build)
+    suite = Suite(args.output or args.build, args.build, executor=args.executor)
     target = '/tmp/md-mount-api-' + suite.report['id']
     prefix = [suite.runner, '--store', args.store, '--user', '0:0', '--network', 'routed']
     if args.base:
         prefix += ['--env', 'SHROOT_MACHINE_ENTRY=0']
     suite.report['entry'] = 'base' if args.base else 'default'
     try:
-        suite.transport.upload(suite.client, Path(__file__), suite.base + '/test.py')
+        suite.upload(Path(__file__), suite.base + '/test.py')
         suite.command(['/system/bin/ln', '-s', 'test.py', suite.base + '/linked.py'])
         suite.command(prefix + ['--', '/bin/mkdir', target])
         suite.command(prefix + ['--bind-ro', suite.base, target, '--deadline-seconds', '30', '--',

@@ -1,5 +1,9 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
+    <string name="console_app_title">User</string>
+    <string name="executor_android_shell">Shell</string>
+    <string name="black_screen">Pantalla negra (sin suspensión)</string>
+    <string name="black_screen_hint">Pantalla negra; pulsa una tecla de volumen para salir</string>
     <string name="guest_command_access">Permitir el control de MagicDesk y Android</string>
     <string name="guest_environments">Entornos Shroot</string>
     <string name="guest_loading">Cargando entornos&#8230;</string>
@@ -70,8 +74,8 @@
     <string name="display_tasks_unknown">Aplicaciones: no disponible</string>
     <string name="display_independent_apps">Aplicaciones independientes</string>
     <string name="start_mode_default">Auto</string>
-    <string name="start_mode_windowed">Ventana del escritorio</string>
-    <string name="start_mode_fullscreen">Pantalla completa del escritorio</string>
+    <string name="start_mode_windowed">Ventana</string>
+    <string name="start_mode_fullscreen">Pantalla completa</string>
     <string name="start_mode_independent">Independiente</string>
     <string name="start_new_window">Nueva ventana</string>
     <string name="start_launch_mode">Modo de inicio</string>
@@ -248,11 +252,13 @@
     <string name="command_app_directory_invalid">Introduce un directorio absoluto</string>
     <string name="command_app_mime_invalid">Introduce tipos MIME válidos separados por punto y coma</string>
     <string-array name="command_app_backends">
-        <item>Shell de Android</item>
+        <item>Shell</item>
         <item>Termux</item>
         <item>Gráficos de Termux</item>
         <item>Linux (Termux)</item>
-        <item>Linux (Shell / root)</item>
+        <item>Linux (Shell)</item>
+        <item>User</item>
+        <item>Linux (User)</item>
     </string-array>
     <string-array name="command_app_file_arguments_values">
         <item>Ninguno</item>
@@ -649,8 +655,8 @@
     <string name="notification_hw_connected">Teclado físico conectado</string>
     <string name="notification_hw_disconnected">Sin teclado físico</string>
     <string name="notification_automation_ready">Servidor de automatización listo</string>
-    <string name="notification_open_touchpad">Abrir panel táctil</string>
-    <string name="notification_open_terminal">Terminal</string>
+    <string name="notification_open_control_panel">Panel de control</string>
+    <string name="notification_black_screen">Pantalla negra</string>
     <string name="control_status_ready">Listo</string>
     <string name="capability_android_15_required">Requiere Android 15 o posterior</string>
     <string name="capability_access_required">Requiere acceso shell o root</string>
@@ -819,6 +825,9 @@
     <string name="settings_nubia_projection_guard_summary">Desactiva temporalmente el software de transmisión Nubia, su escudo de privacidad y la interfaz de conexión durante el escritorio HDMI o Miracast. Los restaura al cerrar el último escritorio externo; los ajustes de privacidad guardados no cambian.</string>
     <string name="settings_section_automation">Automatización</string>
     <string name="settings_section_android">Sistema Android</string>
+    <string name="settings_child_process_restrictions">Desactivar restricciones de procesos hijos</string>
+    <string name="settings_child_process_description">Desactiva la supervisión de procesos fantasma de Android para todas las aplicaciones, incluidas Termux y las sesiones Linux. Este ajuste del sistema se conserva al cerrar MagicDesk. No evita la finalización por falta de memoria ni las restricciones de batería del fabricante.</string>
+    <string name="settings_child_process_unavailable">El ajuste de supervisión de procesos hijos de Android no está disponible.</string>
     <string name="settings_system_desktop_mode">Modo de escritorio del sistema en pantallas externas</string>
     <string name="settings_system_desktop_mode_apply_notice">Vuelve a conectar la pantalla externa para aplicar el cambio. Algunos dispositivos pueden requerir reiniciar Android.</string>
     <string name="settings_system_desktop_mode_confirm">¿Cambiar el modo de escritorio de Android en pantallas externas? Activarlo puede añadir barras de navegación del sistema. Vuelve a conectar la pantalla tras el cambio; algunos dispositivos pueden requerir reiniciar Android.</string>
@@ -1201,4 +1210,14 @@
         <item quantity="many">%d archivos adjuntos</item>
         <item quantity="other">%d archivos adjuntos</item>
     </plurals>
+    <string name="graphics_offscreen">Sin pantalla</string>
+    <string name="graphics_closing">Esperando el cierre de las aplicaciones</string>
+    <string name="graphics_cancel_close">Cancelar cierre pendiente</string>
+    <string name="graphics_close_normally">Cerrar normalmente</string>
+    <string name="graphics_output_width">Anchura de salida</string>
+    <string name="graphics_output_height">Altura de salida</string>
+    <string name="graphics_detach_output">Liberar salida sin pantalla</string>
+    <string name="graphics_force_stop_session">¿Detener esta sesión gráfica y desconectar sus aplicaciones sin guardar?</string>
+    <string name="phone_panel_power_off">Apagar físicamente la pantalla</string>
+    <string name="phone_panel_unavailable">El control físico de la pantalla no está disponible</string>
 </resources>

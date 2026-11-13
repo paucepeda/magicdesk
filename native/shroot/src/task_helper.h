@@ -4,11 +4,14 @@
 #include "interception_memory.h"
 #include "task_send.h"
 #include "task_receive.h"
+#include "task_call.h"
+#include "task_birth.h"
 #include <sys/user.h>
 #include <sys/types.h>
 #include <asm/ptrace.h>
 #include <linux/seccomp.h>
 #include <signal.h>
+#include <sys/stat.h>
 
 struct md_task_helpers;
 struct md_task_wait;
@@ -26,10 +29,16 @@ struct md_task_helper_request {
     /* CAPTURE only: copied before acceptance, resolved in captured FS context.
      * O_PATH captures objects; an exact own-process fdinfo path may instead be
      * opened read-only and exported intact, preserving its live table lookup.
+     * Process status/stat/limits and mount tables also permit read-only capture;
+     * the kernel admits their paths with the caller's real credentials.
      * FD_TABLE takes no path/flags: it opens /proc/<exact owner tid>/fd read-only
      * in the private table and exports only that directory, never a caller FD. */
     const char *path;
     int flags;
+    int capture_metadata;
+    /* CAPTURE only: bounded getdents snapshot under the same task authority.
+     * Zero retains ordinary descriptor capture without reading its contents. */
+    size_t directory_limit;
     struct md_task_send send;
     /* SEND_CAPTURED only: immutable owned [socket, 0..253 rights] retained on
      * admission. send supplies message, contiguous rights token_slot and flags;
@@ -55,12 +64,18 @@ struct md_task_helper_request {
     void (*captured)(void *);
 };
 struct md_received_fds;
-struct md_task_helper_result { long value; int descriptor; siginfo_t signal; struct md_received_fds *received; };
-/* Completion transfers descriptor ownership, including cancellation. */
+struct md_task_helper_result {
+    long value; int descriptor; siginfo_t signal; struct md_received_fds *received;
+    struct stat metadata;
+    void *directory;
+    size_t directory_size;
+};
+/* Completion transfers descriptor and directory ownership, including cancellation. */
 typedef void (*md_task_helper_complete)(void *, struct md_task_helper_result);
 struct md_task_helper_callbacks {
     long (*trace)(int, pid_t, void *, void *);
-    /* Claim an early newborn stop, if already recorded by the outer loop. */
+    /* Transfer early ownership as md_task_birth_stop or negative errno.
+     * PENDING also covers a LISTENing child awaiting native CONT. */
     int (*newborn)(pid_t);
     /* Shared fair collection includes private tasks until their terminal wait. */
     struct md_task_wait *wait;
@@ -83,11 +98,23 @@ int md_task_helper_retiring(struct md_task_helpers *,pid_t group,pid_t task);
  * memory owner, scratch stack and buffer lease. No caller FD is installed.
  * Completion occurs once after helper reaping or a confirmed pre-birth error.
  * The caller orders any FS/table inputs through context capture and retains
- * its continuation until completion; detach cannot resume a dead task. */
+ * its continuation until completion; detach cannot resume a dead task.
+ * Unshielded callers acquire an asynchronous signal shield until their
+ * register continuation is restored, before invoking completion. */
 int md_task_helper_begin(struct md_task_helpers *, pid_t owner, pid_t group,
         const struct user_pt_regs *, const struct md_interception_abi *,
         struct md_interception_memory *, const struct md_interception_buffer *,
         const struct md_task_helper_request *, md_task_helper_complete, void *completion);
+/* Borrow an arbitrary stopped task, restoring its exact syscall/user boundary
+ * before completion. The caller owns quiescence and checkpoint suspension for
+ * the parent; newborn helpers retain the ordinary checkpoint owner. */
+int md_task_helper_borrow(struct md_task_helpers *, pid_t owner, pid_t group,
+        enum md_task_call_boundary, const struct user_pt_regs *, const struct md_interception_abi *,
+        struct md_interception_memory *, const struct md_interception_buffer *,
+        const struct md_task_helper_request *, md_task_helper_complete, void *completion);
+/* Active borrowed parent only. The enclosing signal/quiescence owner may
+ * retain a signal or acknowledge its own interrupt with task_call_resume(). */
+struct md_task_call *md_task_helper_call(struct md_task_helpers *, pid_t owner);
 /* Owner terminal/exec notification must precede record reuse. */
 int md_task_helper_detach(struct md_task_helpers *, pid_t owner);
 /* 1 consumed, 0 belongs to the ordinary guest path, negative errno fatal.

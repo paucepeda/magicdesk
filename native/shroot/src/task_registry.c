@@ -2,6 +2,7 @@
 #include "task_resources.h"
 #include "task_status.h"
 #include "kernel_policy.h"
+#include "signal_origin.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -10,18 +11,29 @@
 #include <unistd.h>
 
 enum { BUCKETS = 127 };
+struct task_group { struct task_group *next; pid_t pid; unsigned count; };
 struct md_task_snapshot_state {
     atomic_uint refs;
     atomic_int status_fd;
     struct md_task_snapshot value;
 };
+struct reaped_sender {
+    uid_t uid;
+    unsigned count;
+    int reboot_signal;
+    struct md_pid_number_value *numbers;
+};
 struct entry {
     struct entry *next;
     struct entry *retired_next, **retired_previous;
-    pid_t tid, tgid;
-    int retired;
+    pid_t tid, tgid, parent;
+    uint64_t generation;
+    int retired, reaped;
+    struct reaped_sender sender;
+    struct task_group *group;
     struct md_process_member *process;
     struct md_identity value;
+    struct md_process_access *access;
     struct md_guest_domain *fs;
     struct md_mount_namespace *mounts;
     struct md_fd_origins *files;
@@ -36,8 +48,41 @@ struct entry {
     struct md_task_snapshot_state *snapshot;
 };
 struct md_task_registry { pthread_mutex_t lock; pid_t owner; struct entry *retired, *entries[BUCKETS];
+    struct task_group *groups[BUCKETS];
     struct md_kernel_policy *kernel_policy;
+    uint64_t generation;
 };
+/* Caller holds the registry lock or is its sole writer. */
+static struct entry *find_entry(const struct md_task_registry *r,pid_t tid) {
+    struct entry *e=r->entries[(unsigned)tid%BUCKETS];
+    while (e && e->tid!=tid) e=e->next;
+    return e;
+}
+static struct task_group *group_join(struct md_task_registry *r,pid_t pid) {
+    unsigned bucket=(unsigned)pid%BUCKETS;
+    struct task_group *g=r->groups[bucket];
+    while (g && g->pid!=pid) g=g->next;
+    if (!g) {
+        g=calloc(1,sizeof(*g));
+        if (!g) return NULL;
+        g->pid=pid; g->next=r->groups[bucket]; r->groups[bucket]=g;
+    }
+    ++g->count; return g;
+}
+static void group_leave(struct md_task_registry *r,struct task_group *g) {
+    if (!g || --g->count) return;
+    struct task_group **slot=&r->groups[(unsigned)g->pid%BUCKETS];
+    while (*slot!=g) slot=&(*slot)->next;
+    *slot=g->next; free(g);
+}
+unsigned md_task_registry_thread_count(struct md_task_registry *r,pid_t pid) {
+    if (!r || pid<=0) return 0;
+    pthread_mutex_lock(&r->lock);
+    struct task_group *g=r->groups[(unsigned)pid%BUCKETS];
+    while (g && g->pid!=pid) g=g->next;
+    unsigned count=g ? g->count : 0;
+    pthread_mutex_unlock(&r->lock); return count;
+}
 struct md_kernel_policy *md_task_registry_kernel_policy(struct md_task_registry *r) {
     if (!r) { errno=EINVAL; return NULL; }
     pthread_mutex_lock(&r->lock);
@@ -58,6 +103,7 @@ static int identity_equal(const struct md_identity *a,const struct md_identity *
         && a->groups==b->groups && a->user_namespace==b->user_namespace;
 }
 static void release_live(struct entry *e) {
+    md_process_access_release(e->access);
     md_domain_unpin(e->fs); md_mount_namespace_release(e->mounts);
     md_fd_origins_unpin(e->files); md_pid_identity_release(e->pid_group);
     md_cgroup_namespace_release(e->cgroup_namespace);
@@ -72,6 +118,7 @@ static void release_entry(struct entry *e) {
     release_live(e); md_identity_release(&e->value);
     md_pid_identity_release(e->pid);
     md_cgroup_member_depart(e->cgroup,e->tid); md_cgroup_member_release(e->cgroup);
+    free(e->sender.numbers);
     free(e);
 }
 struct md_task_registry *md_task_registry_create(void) {
@@ -86,6 +133,9 @@ void md_task_registry_destroy(struct md_task_registry *r) {
         struct entry *e = r->entries[i]; r->entries[i] = e->next;
         release_entry(e);
     }
+    for (unsigned i=0;i<BUCKETS;++i) while (r->groups[i]) {
+        struct task_group *g=r->groups[i]; r->groups[i]=g->next; free(g);
+    }
     md_kernel_policy_release(r->kernel_policy); pthread_mutex_destroy(&r->lock); free(r);
 }
 int md_task_registry_publish(struct md_task_registry *r, pid_t tid, pid_t tgid,
@@ -96,7 +146,10 @@ int md_task_registry_publish(struct md_task_registry *r, pid_t tid, pid_t tgid,
     int error=md_process_member_identity(process,v);
     if (error) return error;
     /* Publication proves this number belongs to a new live task. */
-    if (r->retired && md_task_registry_retired(r,tid).identity) md_task_registry_reap(r,tid);
+    if (r->retired) {
+        const struct entry *previous=find_entry(r,tid);
+        if (previous && previous->retired) md_task_registry_reap(r,tid);
+    }
     struct md_guest_domain *fs=resources ? resources->fs : NULL;
     struct md_mount_namespace *mounts=resources ? resources->mounts : NULL, *old_mounts=NULL;
     struct md_guest_domain *old_fs=NULL;
@@ -109,20 +162,30 @@ int md_task_registry_publish(struct md_task_registry *r, pid_t tid, pid_t tgid,
     struct md_ipc_namespace *ipc=resources ? resources->ipc : NULL, *old_ipc=NULL;
     struct md_uts_namespace *uts=resources ? resources->uts : NULL, *old_uts=NULL;
     struct md_landlock_policy *landlock=resources ? resources->landlock : NULL, *old_landlock=NULL;
+    struct md_process_access *access=resources ? resources->access : NULL, *old_access=NULL;
     unsigned bucket = (unsigned)tid % BUCKETS;
     pthread_mutex_lock(&r->lock);
     struct entry *e = r->entries[bucket];
     while (e && e->tid != tid) e = e->next;
+    struct task_group *members=e && e->group && e->group->pid==tgid ? e->group : group_join(r,tgid);
+    if (!members) { pthread_mutex_unlock(&r->lock); return -ENOMEM; }
     if (!e) {
+        if (r->generation==UINT64_MAX) { group_leave(r,members); pthread_mutex_unlock(&r->lock); return -EOVERFLOW; }
         e = calloc(1, sizeof(*e));
-        if (!e) { pthread_mutex_unlock(&r->lock); return -ENOMEM; }
+        if (!e) { group_leave(r,members); pthread_mutex_unlock(&r->lock); return -ENOMEM; }
+        e->generation=++r->generation;
         e->tid = tid; e->next = r->entries[bucket]; r->entries[bucket] = e;
     }
+    if (e->group!=members) { group_leave(r,e->group); e->group=members; }
     int same_identity=e->tgid==tgid && identity_equal(&e->value,v);
+    /* Registry publication owns the native membership identity. Moving a task
+     * between cgroups changes the member itself, not this binding. Ordinary
+     * resumes need neither the hierarchy lock nor another membership commit. */
+    int publish_cgroup=e->tgid!=tgid || e->cgroup!=cgroup || e->pid!=pid || e->pid_group!=group;
     struct md_task_snapshot_state *old_snapshot=NULL;
     if (!same_identity || e->fs!=fs || e->mounts!=mounts || e->files!=files || e->pid!=pid
             || e->pid_group!=group || e->cgroup!=cgroup || e->cgroup_namespace!=cgroup_ns
-            || e->network!=network || e->ipc!=ipc || e->uts!=uts || e->landlock!=landlock) {
+            || e->network!=network || e->ipc!=ipc || e->uts!=uts || e->landlock!=landlock || e->access!=access) {
         old_snapshot=e->snapshot; e->snapshot=NULL;
     }
     if (e->fs != fs) { md_domain_pin(fs); old_fs=e->fs; e->fs=fs; }
@@ -137,13 +200,18 @@ int md_task_registry_publish(struct md_task_registry *r, pid_t tid, pid_t tgid,
     if (e->cgroup_namespace!=cgroup_ns) {
         old_cgroup_ns=e->cgroup_namespace; e->cgroup_namespace=md_cgroup_namespace_retain(cgroup_ns);
     }
-    md_cgroup_member_publish(cgroup,tid,tgid,pid,group);
+    if (publish_cgroup) md_cgroup_member_publish(cgroup,tid,tgid,pid,group);
     if (e->network!=network) {
         old_network=e->network; e->network=md_network_namespace_retain(network);
     }
     if (e->ipc!=ipc) { old_ipc=e->ipc; e->ipc=md_ipc_namespace_retain(ipc); }
     if (e->uts!=uts) { old_uts=e->uts; e->uts=md_uts_namespace_retain(uts); }
     if (e->landlock!=landlock) { old_landlock=e->landlock; e->landlock=md_landlock_retain(landlock); }
+    /* Successful credential publication is the common commit point for scalar,
+     * copied and namespace operations. A new exec mm has its own initial state. */
+    if (access && e->access==access && e->tgid && !same_identity)
+        md_process_access_credentials(access,&e->value,v);
+    if (e->access!=access) { old_access=e->access; e->access=md_process_access_retain(access); }
     if (same_identity) goto published;
     struct md_identity next = md_identity_copy(v);
     md_identity_release(&e->value); e->value = next; e->tgid = tgid;
@@ -161,6 +229,7 @@ published:
     md_ipc_namespace_release(old_ipc);
     md_uts_namespace_release(old_uts);
     md_landlock_release(old_landlock);
+    md_process_access_release(old_access);
     return 0;
 }
 void md_task_registry_forget(struct md_task_registry *r, pid_t tid) {
@@ -170,11 +239,11 @@ void md_task_registry_forget(struct md_task_registry *r, pid_t tid) {
     while (*slot && (*slot)->tid != tid) slot = &(*slot)->next;
     struct entry *e = *slot;
     if (e && e->retired) e=NULL;
-    if (e) *slot = e->next;
+    if (e) { *slot = e->next; group_leave(r,e->group); e->group=NULL; }
     pthread_mutex_unlock(&r->lock);
     if (e) { md_cgroup_member_reaped(e->cgroup); release_entry(e); }
 }
-void md_task_registry_retire(struct md_task_registry *r,pid_t tid,const struct md_identity *identity) {
+void md_task_registry_retire(struct md_task_registry *r,pid_t tid,pid_t parent,const struct md_identity *identity) {
     if (!r || tid<=0) return;
     pthread_mutex_lock(&r->lock);
     struct entry *e=r->entries[(unsigned)tid%BUCKETS];
@@ -182,12 +251,14 @@ void md_task_registry_retire(struct md_task_registry *r,pid_t tid,const struct m
     struct entry live={0};
     if (e && !e->retired) {
         live=*e;
+        group_leave(r,e->group); e->group=NULL;
         e->value=md_identity_copy(identity);
+        e->parent=parent;
         e->retired=1; e->retired_next=r->retired; e->retired_previous=&r->retired;
         if (r->retired) r->retired->retired_previous=&e->retired_next;
         r->retired=e;
         e->fs=NULL; e->mounts=NULL; e->files=NULL; e->pid_group=NULL;
-        e->cgroup_namespace=NULL; e->network=NULL; e->ipc=NULL; e->uts=NULL; e->landlock=NULL;
+        e->cgroup_namespace=NULL; e->network=NULL; e->ipc=NULL; e->uts=NULL; e->landlock=NULL; e->access=NULL;
         e->snapshot=NULL;
     }
     pthread_mutex_unlock(&r->lock);
@@ -199,17 +270,16 @@ void md_task_registry_retire(struct md_task_registry *r,pid_t tid,const struct m
 }
 struct md_task_retired_view md_task_registry_retired(const struct md_task_registry *r,pid_t tid) {
     if (!r || tid<=0) return (struct md_task_retired_view){0};
-    struct entry *e=r->entries[(unsigned)tid%BUCKETS];
-    while (e && e->tid!=tid) e=e->next;
-    return e && e->retired ? (struct md_task_retired_view){&e->value,e->pid,e->cgroup,e->process}
+    const struct entry *e=find_entry(r,tid);
+    return e && e->retired ? (struct md_task_retired_view){e->reaped ? NULL : &e->value,e->pid,e->cgroup,e->process,e->parent}
         : (struct md_task_retired_view){0};
 }
 int md_task_registry_has_retired(const struct md_task_registry *r) { return r && r->retired!=NULL; }
 void md_task_registry_retired_processes(const struct md_task_registry *r,
         void (*visit)(void *,pid_t,struct md_task_retired_view),void *context) {
     if (!r) return;
-    for (const struct entry *e=r->retired;e;e=e->retired_next) if (e->tid==e->tgid)
-        visit(context,e->tid,(struct md_task_retired_view){&e->value,e->pid,e->cgroup,e->process});
+    for (const struct entry *e=r->retired;e;e=e->retired_next) if (e->tid==e->tgid && !e->reaped)
+        visit(context,e->tid,(struct md_task_retired_view){&e->value,e->pid,e->cgroup,e->process,e->parent});
 }
 void md_task_registry_reap(struct md_task_registry *r,pid_t tid) {
     if (!r || tid<=0) return;
@@ -224,6 +294,47 @@ void md_task_registry_reap(struct md_task_registry *r,pid_t tid) {
     }
     pthread_mutex_unlock(&r->lock);
     if (e) { md_cgroup_member_reaped(e->cgroup); release_entry(e); }
+}
+void md_task_registry_reap_deferred(struct md_task_registry *r,pid_t tid) {
+    if (!r || tid<=0) return;
+    pthread_mutex_lock(&r->lock);
+    struct entry *e=find_entry(r,tid);
+    struct entry released={0};
+    if (e && e->retired && !e->reaped) {
+        unsigned count=md_pid_namespace_depth(md_pid_identity_namespace(e->pid));
+        struct md_pid_number_value *numbers=count ? malloc(count*sizeof(*numbers)) : NULL;
+        if (!count || numbers) {
+            released=*e;
+            e->sender=(struct reaped_sender){.uid=e->value.uid.real,.numbers=numbers,
+                .reboot_signal=md_pid_identity_reboot_signal(e->pid),
+                .count=md_pid_identity_export(e->pid,numbers)};
+            e->reaped=1; e->value=(struct md_identity){0};
+            e->pid=NULL; e->cgroup=NULL; e->process=NULL;
+        }
+    }
+    pthread_mutex_unlock(&r->lock);
+    if (released.tid) {
+        md_identity_release(&released.value);
+        md_pid_identity_reap(released.pid); md_pid_identity_release(released.pid);
+        md_cgroup_member_reaped(released.cgroup); md_cgroup_member_release(released.cgroup);
+        md_process_member_release(released.process);
+    }
+}
+int md_task_registry_signal_origin(const struct md_task_registry *r,const siginfo_t *info,
+        struct md_signal_origin *out) {
+    if (!r || !md_signal_child_notice(info) || info->si_pid<=0) return 0;
+    const struct entry *e=find_entry(r,info->si_pid);
+    if (!e) return 0;
+    *out=(struct md_signal_origin){.info=*info,.valid=1};
+    if (e->reaped) {
+        out->uid=e->sender.uid; out->count=e->sender.count;
+        out->reboot_signal=e->sender.reboot_signal;
+        if (out->count) memcpy(out->numbers,e->sender.numbers,out->count*sizeof(*out->numbers));
+    } else {
+        out->uid=e->value.uid.real; out->count=md_pid_identity_export(e->pid,out->numbers);
+        out->reboot_signal=md_pid_identity_reboot_signal(e->pid);
+    }
+    return 1;
 }
 void md_task_registry_collect(struct md_task_registry *r,int (*gone)(pid_t)) {
     if (!md_task_registry_has_retired(r)) return;
@@ -271,7 +382,9 @@ int md_task_registry_probe(struct md_task_registry *r, pid_t tid, pid_t peer,
             atomic_init(&state->status_fd,-1);
             struct md_task_snapshot *value=&state->value;
             value->tid=e->tid; value->tgid=e->tgid;
+            value->generation=e->generation;
             value->identity=md_identity_copy(&e->value);
+            value->access=md_process_access_retain(e->access);
             value->fs=e->fs; md_domain_pin(value->fs);
             value->mounts=md_mount_namespace_retain(e->mounts);
             value->files=md_fd_origins_pin(e->files);
@@ -304,10 +417,16 @@ int md_task_registry_credentials(struct md_task_registry *r,pid_t tid,struct md_
     pthread_mutex_lock(&r->lock);
     struct entry *e=r->entries[(unsigned)tid%BUCKETS];
     while (e && e->tid!=tid) e=e->next;
+    if (e && e->reaped) e=NULL;
     int found=e!=NULL;
-    if (e) *out=(struct md_task_credentials){.group=e->tgid,.retired=e->retired,.identity=md_identity_copy(&e->value)};
+    if (e) *out=(struct md_task_credentials){.group=e->tgid,.retired=e->retired,
+        .access=md_process_access_retain(e->access),.generation=e->generation,.identity=md_identity_copy(&e->value)};
     pthread_mutex_unlock(&r->lock);
     return found ? 0 : -ESRCH;
+}
+void md_task_credentials_release(struct md_task_credentials *value) {
+    md_process_access_release(value->access); value->access=NULL;
+    md_identity_release(&value->identity);
 }
 int md_task_registry_proc(struct md_task_registry *r,pid_t tid,struct md_task_snapshot *out) {
     *out=(struct md_task_snapshot){0};
@@ -315,11 +434,21 @@ int md_task_registry_proc(struct md_task_registry *r,pid_t tid,struct md_task_sn
     pthread_mutex_lock(&r->lock);
     struct entry *e=r->entries[(unsigned)tid%BUCKETS];
     while (e && e->tid!=tid) e=e->next;
+    if (e && e->reaped) e=NULL;
     int found=e!=NULL;
-    if (e) *out=(struct md_task_snapshot){.tid=tid,.tgid=e->tgid,.identity=md_identity_copy(&e->value),
+    if (e) *out=(struct md_task_snapshot){.tid=tid,.tgid=e->tgid,.generation=e->generation,.identity=md_identity_copy(&e->value),
+        .access=md_process_access_retain(e->access),
         .pid=md_pid_identity_retain(e->pid),.cgroup=md_cgroup_member_retain(e->cgroup)};
     pthread_mutex_unlock(&r->lock);
     return found ? 0 : -ESRCH;
+}
+int md_task_snapshot_status_install(const struct md_task_snapshot *snapshot,int descriptor) {
+    if (descriptor<0) return -EBADF;
+    if (!snapshot->owner) { close(descriptor); return -EINVAL; }
+    int expected=-1;
+    if (!atomic_compare_exchange_strong_explicit(&snapshot->owner->status_fd,&expected,descriptor,
+            memory_order_release,memory_order_acquire)) close(descriptor);
+    return 0;
 }
 long md_task_snapshot_umask(const struct md_task_snapshot *snapshot) {
     if (!snapshot->owner) return md_task_umask(snapshot->tid);
@@ -342,6 +471,7 @@ void md_task_snapshot_release(struct md_task_snapshot *snapshot) {
         return;
     }
     md_identity_release(&snapshot->identity);
+    md_process_access_release(snapshot->access);
     md_domain_unpin(snapshot->fs);
     md_mount_namespace_release(snapshot->mounts);
     md_fd_origins_unpin(snapshot->files);

@@ -1,18 +1,22 @@
 """External port observer and a tiny container service for Docker networking tests."""
+from contextlib import ExitStack
 import http.client
 import errno
 import ipaddress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+from pathlib import Path
 import queue
 import secrets
+import select
 import socket
 import socketserver
 import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -43,20 +47,28 @@ def wait_service(command):
 
 
 def exchange(host, port, token, repeats=1, family=socket.AF_INET):
-    if repeats > 1:
-        for _ in range(repeats):
-            exchange(host, port, token, family=family)
-        return
     host = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)[0][4][0]
-    with socket.create_connection((host, port), timeout=10) as connection:
-        connection.sendall(b'PING')
-        data = connection.recv(100).decode()
-        assert data == token, ('TCP reply', host, port, data, token)
-    with socket.socket(family, socket.SOCK_DGRAM) as connection:
-        connection.settimeout(10)
-        connection.sendto(b'PING', (host, port))
-        data, peer = connection.recvfrom(100)
-        assert data.decode() == token and peer[:2] == (host, port), (data, peer)
+    for index in range(repeats):
+        stage = 'tcp-connect'
+        local = None
+        try:
+            with socket.create_connection((host, port), timeout=10) as connection:
+                local = connection.getsockname()
+                stage = 'tcp-send'
+                connection.sendall(b'PING')
+                stage = 'tcp-receive'
+                data = connection.recv(100).decode()
+                assert data == token, ('TCP reply', host, port, data, token)
+            with socket.socket(family, socket.SOCK_DGRAM) as connection:
+                connection.settimeout(10)
+                stage = 'udp-send'
+                connection.sendto(b'PING', (host, port))
+                local = connection.getsockname()
+                stage = 'udp-receive'
+                data, peer = connection.recvfrom(100)
+                assert data.decode() == token and peer[:2] == (host, port), (data, peer)
+        except Exception as error:
+            raise AssertionError(f'{stage} {index + 1}/{repeats} from {local} at {host}:{port}: {error!r}') from error
 
 
 def container_service(token, family=socket.AF_INET):
@@ -236,10 +248,7 @@ class Observer:
                         connection.listen()
                         owner.reservations.append(connection)
                     elif item['operation'] == 'released':
-                        for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
-                            with socket.socket(family, kind) as connection:
-                                connection.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                                connection.bind((host, port))
+                        owner.wait_released(family, host, port)
                     elif item['operation'] == 'denied':
                         for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
                             with socket.socket(family, kind) as connection:
@@ -274,13 +283,15 @@ class Observer:
 
     def allocate_port(self, family=socket.AF_INET):
         # Reserve both protocols outside Shroot; release just before publication.
+        # Service ports stay below Linux's default ephemeral range: automatic
+        # forwarding deliberately excludes ephemeral client ports.
         # Only allocation races are retried, never a failed container publication.
         for _ in range(32):
             tcp = socket.socket(family, socket.SOCK_STREAM)
             udp = socket.socket(family, socket.SOCK_DGRAM)
             try:
                 host = self.ipv6_host if family == socket.AF_INET6 else '127.0.0.1'
-                tcp.bind((host, 0))
+                tcp.bind((host, 1024 + secrets.randbelow(32768 - 1024)))
                 port = tcp.getsockname()[1]
                 udp.bind((host, port))
                 tcp.listen()
@@ -294,6 +305,26 @@ class Observer:
                 return port
         raise OSError(errno.EADDRINUSE, 'No free paired TCP/UDP port')
 
+    @staticmethod
+    def wait_released(family, host, port, timeout=5):
+        # Bounded state wait: automatic forwarders observe container teardown
+        # asynchronously. Require both real host ports to become available.
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                with ExitStack() as sockets:
+                    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+                        connection = socket.socket(family, kind)
+                        sockets.callback(connection.close)
+                        connection.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        connection.bind((host, port))
+                return
+            except OSError as error:
+                remaining = deadline - time.monotonic()
+                if error.errno != errno.EADDRINUSE or remaining <= 0:
+                    raise
+                select.select([], [], [], min(.05, remaining))
+
     def close(self):
         self.server.shutdown()
         self.server.server_close()
@@ -305,7 +336,10 @@ class Observer:
 
 def observe(address, **request):
     port, token = address.split('/')
-    connection = http.client.HTTPConnection('127.0.0.1', int(port), timeout=30)
+    # The control request contains sequential TCP/UDP exchanges. Its deadline
+    # must cover their unchanged per-operation bounds, not cancel a busy peer.
+    timeout = 30 + 40 * request.get('repeats', 1) if request.get('operation') == 'exchange' else 30
+    connection = http.client.HTTPConnection('127.0.0.1', int(port), timeout=timeout)
     try:
         connection.request('POST', '/' + token, json.dumps(request))
         response = connection.getresponse()
@@ -317,16 +351,64 @@ def observe(address, **request):
         connection.close()
 
 
+def http_exchange(url, repeats=20):
+    token = url.split('/')[-2]
+    for index in range(repeats):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                assert response.status == 200
+                assert response.read().decode() == token
+        except Exception as error:
+            raise AssertionError(f'Outbound HTTP connection {index + 1}/{repeats} failed') from error
+    print('CONTAINER_OUTBOUND_OK', repeats, flush=True)
+
+
+def file_operations():
+    """Exercise the writable container layer and another exec under its policy."""
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix='md-container-files-') as directory:
+        root = Path(directory)
+        original, renamed, link = (root/name for name in ('original', 'renamed', 'link'))
+        data = bytes(range(256))*512
+        original.write_bytes(data)
+        with original.open('rb') as opened:
+            original.rename(renamed)
+            os.link(renamed, link)
+            assert os.stat(renamed).st_ino == os.stat(link).st_ino
+            assert os.fstat(opened.fileno()).st_nlink == 2
+            renamed.unlink()
+            assert opened.read() == data and os.fstat(opened.fileno()).st_nlink == 1
+        child = subprocess.run([sys.executable, __file__, '--files-child', str(link)],
+                               capture_output=True, text=True, timeout=30)
+        assert child.returncode == 0 and 'CONTAINER_FILES_CHILD_OK' in child.stdout, child
+        for _ in range(128):
+            original.write_bytes(b'cycle')
+            original.rename(renamed)
+            assert renamed.read_bytes() == b'cycle'
+            renamed.unlink()
+        for _ in range(4096):
+            with link.open('rb') as opened:
+                assert os.fstat(opened.fileno()).st_size == len(data)
+                assert opened.read(4) == data[:4]
+        link.unlink()
+        assert not list(root.iterdir())
+    print('CONTAINER_FILES_OK', json.dumps(dict(seconds=time.monotonic()-started,
+          cycles=128, opens=4096, child=child.stdout.strip())), flush=True)
+
+
 if __name__ == '__main__':
     if sys.argv[1] == '--http':
-        with urllib.request.urlopen(sys.argv[2], timeout=5) as response:
-            assert response.status == 200
-            assert response.read().decode() == sys.argv[2].split('/')[-2]
-        print('CONTAINER_OUTBOUND_OK', flush=True)
+        http_exchange(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 20)
     elif sys.argv[1] == '--internet':
         internet()
     elif sys.argv[1] == '--internet-ipv6':
         internet_ipv6()
+    elif sys.argv[1] == '--files':
+        file_operations()
+    elif sys.argv[1] == '--files-child':
+        assert Path(sys.argv[2]).read_bytes() == bytes(range(256))*512
+        assert Path('/proc/self/status').read_text().split('Seccomp:')[1].split()[0] == '2'
+        print('CONTAINER_FILES_CHILD_OK', flush=True)
     elif sys.argv[1] == '--client':
         exchange(sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5]) if len(sys.argv)>5 else 1,
                  socket.AF_INET6 if '--ipv6' in sys.argv[6:] else socket.AF_INET)

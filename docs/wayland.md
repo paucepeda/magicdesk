@@ -32,7 +32,8 @@ libraries (`libc`, `libm`, `libdl`, `libandroid`, `liblog`). The host renderer u
 `ANativeWindow` API and does not link wlroots or load Termux libraries.
 
 The launch integration shares the X11 execution model: Termux is an optional
-client executor; shell clients use the explicitly authorized command identity,
+client executor; User clients run as MagicDesk's app UID without Shizuku, and
+Shell clients use the explicitly authorized command identity,
 while their compositor runs under MagicDesk's app UID, never an elevated renderer
 UID. Termux clients use the compositor's private named socket, allowing each
 program and its children to establish independent connections. UID-2000 shell
@@ -43,12 +44,12 @@ The launch recipe selects the connection contract through
 `X-MagicDesk-GraphicsConnection`, independently of executor UID. `inherited`
 selects one existing FD; `routed` selects the experimental
 [guest runtime's admission endpoint](shroot.md#graphical-connections).
-That endpoint supports independent guest clients under UID 2000: the shell
-service accepts connections, checks peer UID and transfers connected descriptors
+That endpoint supports independent guest clients under User and Shell: the
+selected executor accepts connections, checks peer UID and transfers connected descriptors
 to the compositor. `mdw_server_accept` consumes each FD on the protocol event
 loop, including on failure. Protocol traffic and shared buffers do not go through
 Binder or a stream proxy. The server lifecycle closes pending admission FDs.
-Desktop, HOME and root are not prerequisites for the Termux path.
+Desktop, HOME and root are not prerequisites for User or Termux.
 
 An app-UID compositor's private socket directory is not a shell-client launch
 transport. The native `mdw_server_connect` API creates an already connected
@@ -502,7 +503,8 @@ whole-desktop presentation and the same **Interface scale** control. The prefere
 adjusts each Android host's automatic scale and updates its output and client
 limits together. Start's installed-app context menu and `graphics.set_scale`
 share the same profile, keyed by executor and launcher path within the Android
-profile. Ad-hoc sessions retain their percentage only until stopped. Nested
+profile, for User, Shell and Termux launchers. Ad-hoc sessions retain their
+percentage only until stopped. Nested
 compositors and applications remain responsible for their toolkit preferences.
 
 For a nested desktop, select **Nested Linux desktop** in the manager, or set

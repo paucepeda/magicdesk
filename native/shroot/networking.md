@@ -41,8 +41,14 @@ fabrics.
 
 Published TCP/UDP ports become shared typed DNAT rules reached from PREROUTING
 and OUTPUT on the gateway;
-private guest binds do not automatically publish. `network_filter_update`
-shares validation, direct-flow compatibility, frontend reservation and commit
+private guest binds do not automatically publish.
+Local loopback clients are source-translated to the gateway address for both
+families before entering the private link; external client addresses remain
+unchanged. Conntrack retains the original tuple for replies. This keeps guest
+reverse-path filtering meaningful without disabling it or leaking loopback
+addresses across the link.
+
+`network_filter_update` shares validation, direct-flow compatibility, frontend reservation and commit
 with the nftables adapter. It prepares all resources before state replacement;
 the netlink adapter still publishes its ACK before committing. Failure aborts
 all reservations. Teardown joins the existing forwarding owner and releases
@@ -159,13 +165,21 @@ explicit binds (including port zero) and listeners reserve real Android ports
 through separate forwarding frontends; automatic outgoing binds do not publish
 a listener. Guest backing sockets use ephemeral native ports. Conflicts and
 final release belong to the same endpoint/forwarding owners.
+Reusable UDP wildcard and address-specific endpoints share the existing physical
+listener. Closing the wildcard retains that listener while a matching endpoint
+still owns it; ingress must resolve a live logical receiver before delivery.
+This admission does not add interception to ordinary payload read/write.
 Local OUTPUT uses loopback interface metadata, independently of the FIB owner
 used for source selection and scoped endpoint binding. DNAT reroutes the
 translated destination through the same flow owner. Socket output binding
 applies only before egress, including veth pairs in the same namespace;
 generation-based route revalidation retains that binding only for the originating
 egress. Ingress performs a new route lookup and retains the incoming interface's
-IPv6 link-local scope. Nftables element deletion
+IPv6 link-local scope. Local delivery retains the destination interface's scope
+for socket selection and received packet info while firewall INPUT still sees
+loopback. Per-message IPv6 packet info participates in interface selection before
+link-local scope validation, including when sockaddr supplies no scope ID.
+Nftables element deletion
 selects by key; an echoed value does not change the match or retain a verdict
 target. Both contracts are covered by native network tests and the nspawn
 command/publication lifecycle fixture.
@@ -356,6 +370,9 @@ A scoped thread-local pointer selects a context during callbacks; it contains
 no shared protocol state. A build-time symbol audit rejects mutable globals
 outside that selector. Dynamic stack allocations are capped at 64 MiB per
 namespace and reclaimed together on retirement, including unfinished fragments.
+TCP initial sequence numbers use a monotonic four-microsecond clock and a
+namespace-secret hash of the address/port tuple, independent of idle protocol
+timers. This is connection-admission work, not per-packet or native IO work.
 
 The existing fabric event loop drives bounded packet batches, nonblocking
 channel IO and a monotonic protocol timer. No thread is created per stack or
@@ -374,6 +391,14 @@ owner; dynamic entries remain in lwIP. Permanent entries do not require a packet
 stack. Committed static changes invalidate matching dynamic caches; failed
 publication leaves both unchanged. Writes require namespace `CAP_NET_ADMIN`;
 proxy ARP is unsupported.
+
+Administrative link flags share one rtnetlink/ioctl owner. `IFF_NOARP` is
+available on managed links, including TAP: packet-stack unicast without a static
+neighbor uses the link's own hardware address without ARP/ND resolution, while
+multicast keeps its protocol mapping. ARP input/output is suppressed and flag
+transitions retire dynamic neighbor state. Masked updates preserve other flags;
+an unmasked nonzero flag set replaces mutable flags, while an attribute-only
+zero/zero update preserves them. These changes do not intercept native payload IO.
 
 Shroot remains the address/route authority; lwIP does not run DHCP, DNS or SLAAC
 configuration or independent IPv6 MTU updates. Both families use the link MTU
@@ -441,8 +466,12 @@ Queries and mutations require CAP_NET_ADMIN in the namespace's user owner.
 
 `network_conntrack` exposes CTNETLINK dumps and tuple lookup for managed TCP/UDP
 relays, with namespace-local original/reply tuples, NAT status, marks and expiry.
-UDP deletion retires the mapping after successful ACK publication, preserving
-the guest-facing socket. Its next datagram receives fresh routing/NAT admission.
+UDP deletion retires the mapping after successful ACK publication. Deletion and
+idle expiry preserve carriers still owned by guest sockets, including a connected
+receiver's reply port. The next datagram receives fresh routing/NAT admission.
+Re-admission retains explicit output bindings and native-listener ingress
+authority, not an interface selected by an obsolete route. An unbound sender
+can therefore reach a replacement peer namespace without reconnecting its socket.
 `network_tracking` separates TCP records from the retained transport and NAT
 binding. Deletion or idle expiry removes only the selected namespace's record;
 accepted payload recreates it with a fresh ID. Namespace-local marks do not cross
@@ -518,7 +547,10 @@ Random selection runs only on NAT admission and uses the existing collision
 reservations; retained mappings keep their chosen port. Xtables DNAT/SNAT state
 aliases are ORed with ordinary conntrack state using the flow's NAT status.
 ACCEPT ends a chain, not a hook; later
-base chains may deny it. RETURN applies the base policy.
+base chains may deny it. RETURN applies the base policy. Register comparisons
+support EQ, NEQ, LT, LTE, GT and GTE in network-byte order for the declared
+operand width. NAT publication uses that same comparison owner; an unresolved
+ordered predicate is not treated as a finite set of candidate ports.
 `route` OUTPUT chains repeat route selection after a mark/address change and
 publish the selected output to later chains. They use the same policy-routing
 owner as socket admission; unsupported route-chain hooks fail at installation.
@@ -537,9 +569,10 @@ established native streams close with SO_LINGER reset, so peers observe RST
 rather than waiting for a DROP timeout. Existing direct streams retain the
 ordinary policy-update rule: an update requiring mediation returns EBUSY.
 `network_reject` owns typed TCP/ICMP refusals and socket error conversion.
-nft ICMP/ICMPv6 unreachable, inet `icmpx`, and revision-zero xtables unreachable
+nft ICMP/ICMPv6 unreachable, family-dependent raw ICMP in `inet`, inet `icmpx`, and revision-zero xtables unreachable
 targets share that owner. Address/connection admission returns the corresponding
-errno. On TUN/TAP, the packet owner sends an actual ICMP reply with checksum and
+Linux-family errno. Raw codes retain their wire value; `icmpx` uses its explicit
+IPv4/IPv6 code translation. On TUN/TAP, the packet owner sends an actual ICMP reply with checksum and
 a bounded quote of the original header, including IPv4 options. A retained
 packet channel uses the relay's generation-cached decision after rule changes;
 it does not re-evaluate the rules for every packet. Incoming, validated ICMP
@@ -660,9 +693,16 @@ The reactor handles nonblocking native sockets, backpressure and TCP half-close.
 TCP has two 64 KiB buffers per mediated flow. UDP preserves datagrams, queues
 temporary EAGAIN up to 64 datagrams/256 KiB per direction, and expires idle
 mappings after 30 seconds, including retained identity for unread queued data.
-This is a bounded flow lifetime, not indefinite native datagram metadata retention.
+Dormant endpoint-owned carriers retain no active conntrack entry, queued payload
+or periodic timer; closing/disconnecting their owners releases them. Multicast
+keeps its sender carrier while its fanout mappings expire independently.
 Queue exhaustion drops datagrams, never reports a
-fake protocol reply. Limits are 512 listeners and 1024 mediated flows per fabric.
+fake protocol reply. Per-fabric limits are 512 listeners, 1024 mediated TCP
+streams and 8192 UDP flows, including dormant carriers. Protocol budgets are
+separate: retained UDP reply identities do not consume TCP's larger-buffer
+allowance. Admission never evicts a valid mapping or extends its idle lifetime.
+Native descriptor and allocation limits still apply, and storage is allocated
+only for admitted flows.
 Idle listeners have no polling timer. Weak namespace/event identities avoid
 ownership cycles and stale FD-reuse events; namespace/endpoint teardown and
 reactor join release all associated resources.
@@ -760,6 +800,10 @@ selected logical network namespace. Logical addresses, ports and guest owner IDs
 come from the endpoint model; the matching native socket inode supplies kernel
 state and queue counters. This is not a dump of Android's host sockets. The
 IPv4 and IPv6 tables project their corresponding live endpoint families.
+When host policy denies the native tables, owned endpoints remain visible with
+their managed bind/listen/connect state. Native queue, timer and retry counters
+are then zero; TCP shutdown substates are not observed. This fallback requires
+neither retained socket descriptions nor interception of ordinary stream IO.
 Unowned terminal entries such as TIME_WAIT sockets are not synthesized.
 An open retains its selected namespace across setns; dup shares the offset,
 and reading from offset zero refreshes the snapshot. Unmanaged host networking

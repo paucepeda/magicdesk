@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interleave Base/lazy entry filesystem, readiness, idle and startup against a reference."""
+"""Interleave Base/lazy filesystem, readiness and startup, with an optional reference."""
 import argparse
 import json
 from pathlib import Path
@@ -9,11 +9,14 @@ import statistics
 from test_oci_services import Suite
 from benchmark_cpu import observe_suite_cpu
 
+CONTROL_WORKLOADS = ('fd-dup', 'fd-stat', 'fd-flags', 'fd-ioctl', 'fd-bytes',
+                     'identity', 'uname', 'ipc-nowait', 'socket-nowait')
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', required=True, type=Path)
-    parser.add_argument('--reference', required=True, type=Path)
+    parser.add_argument('--reference', type=Path,
+                        help='Optional second runtime; it must be executable by the selected identity')
     parser.add_argument('--store', required=True)
     parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--iterations', type=int, default=10000)
@@ -23,11 +26,13 @@ def main():
                         help='Consecutive 1024-operation file blocks per launch (1-64); retain first and tail timings')
     parser.add_argument('--application-filter', action='store_true',
                         help='Install an application ALLOW filter before the measured fixture loop')
+    parser.add_argument('--statistics', action='store_true',
+                        help='Record runtime counters for each workload; not a timing baseline')
     parser.add_argument('--cpu-mask', type=lambda value: int(value, 16),
                         help='Optional native taskset hexadecimal mask for controlled comparisons')
     parser.add_argument('--workload', action='append', choices=(
         'poll', 'epoll', 'epoll-ready', 'idle', 'python-start', 'ls-start', 'file-stat', 'file-open', 'file-cycle',
-        'fd-dup', 'fd-stat', 'fd-flags', 'fd-ioctl'),
+        *CONTROL_WORKLOADS),
         help='Limit a focused repeat; defaults to the complete matrix')
     parser.add_argument('--output', type=Path, default=Path('build/readiness-performance'))
     args = parser.parse_args()
@@ -42,15 +47,19 @@ def main():
             '--deadline-seconds', '60']
     try:
         suite.command([suite.runner, '--store', args.store, '--user', '0:0', '--', '/bin/mkdir', target])
-        suite.transport.upload(suite.client, Path(__file__).with_name('fixtures') / 'readiness-benchmark.c',
+        suite.upload(Path(__file__).with_name('fixtures') / 'readiness-benchmark.c',
                                suite.base + '/benchmark.c')
         suite.command([suite.runner, *base, '--', '/usr/bin/cc', '-O2', '-Wall', '-Wextra',
                        target + '/benchmark.c', '-o', target + '/benchmark'])
-        reference = suite.base + '/reference'
-        suite.command(['mkdir', reference])
-        suite.report['referenceHashes'] = suite.stage_runtime(args.reference, reference)
+        candidates = [('current', suite.runner)]
+        if args.reference:
+            reference = suite.base + '/reference'
+            suite.command(['mkdir', reference])
+            suite.report['referenceHashes'] = suite.stage_runtime(args.reference, reference)
+            candidates.append(('reference', reference + '/libmagicdesk_guest_run.so'))
         suite.report['scope'] = dict(store=args.store,
-            fixture='same guest binary and installed userspace; no timing diagnostics',
+            fixture='same guest binary and installed userspace',
+            instrumented=args.statistics,
             cpuMask=None if args.cpu_mask is None else format(args.cpu_mask, 'x'),
             applicationFilter=args.application_filter,
             timing='loop wall/caller CPU; time -p covers full launch and reaped descendants',
@@ -60,7 +69,7 @@ def main():
         suite.report['fixtureHash'] = suite.command(['sha256sum', suite.base + '/benchmark'], quiet=True)
         placement = [] if args.cpu_mask is None else ['/system/bin/taskset', format(args.cpu_mask, 'x')]
         modes = {}
-        for name, runner in [('current', suite.runner), ('reference', reference + '/libmagicdesk_guest_run.so')]:
+        for name, runner in candidates:
             for mode, enabled in (('base', '0'), ('lazy', '1')):
                 if args.entry_mode in ('both', mode):
                     modes[name + '-' + mode] = [runner, *base, '--env', 'SHROOT_MACHINE_ENTRY=' + enabled]
@@ -72,27 +81,30 @@ def main():
         if args.application_filter:
             for prefix in modes.values():
                 prefix.extend(['--env', 'MD_BENCH_FILTER=1'])
+        if args.statistics:
+            for prefix in modes.values():
+                prefix.append('--statistics')
         workloads = {'poll': [target + '/benchmark', 'poll', str(args.iterations)],
                      'epoll': [target + '/benchmark', 'epoll', str(args.iterations)],
                      'epoll-ready': [target + '/benchmark', 'epoll-ready', str(args.iterations)],
                      'idle': [target + '/benchmark', 'idle', '1'],
                      'python-start': ['/usr/bin/python3', '-c', 'import ssl,asyncio,sqlite3,multiprocessing'],
-                     'ls-start': ['/usr/bin/ls', '--version']}
+                     'ls-start': ['/bin/ls', '--version']}
         file_workloads = {'file-stat', 'file-open', 'file-cycle'}
         for workload in ('file-stat', 'file-open', 'file-cycle'):
             workloads[workload] = [target + '/benchmark', workload, '1024', str(args.file_blocks)]
-        for workload in ('fd-dup', 'fd-stat', 'fd-flags', 'fd-ioctl'):
+        for workload in CONTROL_WORKLOADS:
             workloads[workload] = [target + '/benchmark', workload, str(args.iterations)]
         if args.workload:
             workloads = {name: command for name, command in workloads.items() if name in args.workload}
         measured = {'poll', 'epoll', 'epoll-ready', 'idle', 'file-stat', 'file-open', 'file-cycle',
-                    'fd-dup', 'fd-stat', 'fd-flags', 'fd-ioctl'}
+                    *CONTROL_WORKLOADS}
         suite.report['samples'] = samples = []
         order = list(modes)
         for round_number in range(args.rounds):
             offset = round_number % len(order)
-            for name in order[offset:] + order[:offset]:
-                for workload, command in workloads.items():
+            for workload, command in workloads.items():
+                for name in order[offset:] + order[:offset]:
                     with observe_suite_cpu(suite) as cpu:
                         output = suite.command(['/system/bin/time', '-p', *placement, *modes[name], '--', *command])
                     measurement = dict(re.findall(r'^(real|user|sys)\s+(\d+\.\d+)\s*$', output, re.M))
@@ -100,6 +112,9 @@ def main():
                     row = dict(mode=name, workload=workload, round=round_number, cpu=cpu,
                                launchSeconds=float(measurement['real']),
                                totalCpuSeconds=float(measurement['user']) + float(measurement['sys']))
+                    if args.statistics:
+                        row['runtimeCounters'] = [line for line in output.splitlines()
+                                                  if line.startswith(('MD_', 'SVC_RUNTIME_STATS '))]
                     records = [json.loads(line.removeprefix('READINESS_BENCH '))
                                for line in output.splitlines() if line.startswith('READINESS_BENCH ')]
                     if workload in measured:
@@ -130,7 +145,10 @@ def main():
         try:
             suite.command([suite.runner, '--store', args.store, '--user', '0:0', '--', '/bin/rmdir', target])
         finally:
-            suite.finish()
+            try:
+                suite.command(['rm', '-rf', '--', suite.base], quiet=True)
+            finally:
+                suite.finish()
 
 
 if __name__ == '__main__':

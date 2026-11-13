@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "../shroot/src/cooperative_channel.h"
+#include "../shroot/src/cooperative_exchange.h"
 #include "../shroot/src/fs_syscall.h"
 #include <assert.h>
 #include <asm/ptrace.h>
@@ -11,9 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -123,6 +126,30 @@ static void boundary(uintptr_t pc,int kind) {
     if (kind==4) { n->number=SYS_dup; n->args[0]=fd; }
     if (kind==5) { n->number=SYS_dup3; n->args[0]=fd; n->args[1]=900; n->args[2]=O_CLOEXEC; }
     if (kind==6) { n->number=SYS_fcntl; n->args[0]=fd; n->args[1]=F_DUPFD_CLOEXEC; n->args[2]=900; }
+    int queue=-1,event=-1,pair[2]={-1,-1};
+    char byte='s';
+    struct epoll_event watch={.events=EPOLLIN|EPOLLONESHOT,.data.u64=42},output={0};
+    if (kind==7 || kind==8) {
+        queue=epoll_create1(EPOLL_CLOEXEC); event=eventfd(1,EFD_CLOEXEC|EFD_NONBLOCK);
+        assert(queue>=0 && event>=0);
+        memset(n->args,0,sizeof(n->args));
+        n->args[0]=queue;
+        if (kind==7) {
+            n->number=SYS_epoll_ctl; n->args[1]=EPOLL_CTL_ADD;
+            n->args[2]=event; n->args[3]=(uintptr_t)&watch;
+        } else {
+            assert(!epoll_ctl(queue,EPOLL_CTL_ADD,event,&watch));
+            n->number=SYS_epoll_pwait; n->args[1]=(uintptr_t)&output; n->args[2]=1;
+        }
+    }
+    if (kind>=9) {
+        assert(!socketpair(AF_UNIX,SOCK_DGRAM|SOCK_CLOEXEC,0,pair));
+        memset(n->args,0,sizeof(n->args));
+        n->number=kind==9 ? SYS_sendto : SYS_recvfrom;
+        n->args[0]=pair[kind==10]; n->args[1]=(uintptr_t)&byte;
+        n->args[2]=1; n->args[3]=MSG_DONTWAIT|MSG_NOSIGNAL;
+        if (kind==10) { assert(send(pair[0],&byte,1,0)==1); byte=0; }
+    }
     pid_t child=fork(); assert(child>=0);
     if (!child) {
         alarm(5);
@@ -135,6 +162,10 @@ static void boundary(uintptr_t pc,int kind) {
         if (state==MD_NATIVE_CANCELLED) {
             assert(n->result==-EINTR && descriptors()==before);
             assert(fcntl(fd,F_GETFD)==FD_CLOEXEC);
+        } else if (kind>=7) {
+            assert(descriptors()==before && n->result==(kind==7 ? 0 : 1));
+            if (kind==8) assert(output.data.u64==42 && output.events==EPOLLIN);
+            if (kind==10) assert(byte=='s');
         } else if (!kind) {
             assert(n->result>=0 && descriptors()==before+1);
             assert(fcntl(n->result,F_GETFD)==FD_CLOEXEC);
@@ -150,6 +181,22 @@ static void boundary(uintptr_t pc,int kind) {
             assert(fcntl(n->result,F_GETFD)==(kind==4 ? 0 : FD_CLOEXEC));
             if (kind!=4) assert(n->result>=900);
             assert(!close(n->result));
+        }
+        if (kind==7 || kind==8) {
+            /* ONESHOT distinguishes a cancelled wait from a consumed event;
+             * replaying the action would lose either its result or its readiness. */
+            int ready=state==MD_NATIVE_CANCELLED ? kind==8 : kind==7;
+            assert(epoll_wait(queue,&output,1,0)==ready);
+            if (ready) assert(output.data.u64==42 && output.events==EPOLLIN);
+            assert(!close(queue) && !close(event));
+        }
+        if (kind>=9) {
+            int pending=state==MD_NATIVE_CANCELLED ? kind==10 : kind==9;
+            ssize_t got=recv(pair[1],&byte,1,MSG_DONTWAIT);
+            if (pending) assert(got==1 && byte=='s');
+            else assert(got==-1 && errno==EAGAIN);
+            assert(recv(pair[1],&byte,1,MSG_DONTWAIT)==-1 && errno==EAGAIN);
+            assert(!close(pair[0]) && !close(pair[1]));
         }
         _exit(0);
     }
@@ -178,25 +225,33 @@ static void boundary(uintptr_t pc,int kind) {
         fprintf(stderr,"native boundary kind=%d offset=%zu state=%u status=%#x\n",kind,pc-(uintptr_t)md_cooperative_native,state,status);
     assert(WIFEXITED(status) && !WEXITSTATUS(status));
     assert(!close(fd) && !munmap(n,4096));
+    if (kind==7 || kind==8) assert(!close(queue) && !close(event));
+    if (kind>=9) assert(!close(pair[0]) && !close(pair[1]));
 }
 static struct md_entry_channel channel;
 static void descriptor_lease(void) {
     struct md_entry_channel c={0};
-    assert(md_entry_regular_descriptor(&c)==-1);
-    atomic_store(&c.native_regular,43);
-    assert(md_entry_regular_descriptor(&c)==42);
-    atomic_store(&c.native_regular,MD_ENTRY_RESULT_FD);
+    assert(md_entry_view_descriptor(&c)==-1);
+    md_fd_view_publish(&c.descriptor,43,FD_CLOEXEC,S_IFREG);
+    assert(md_entry_view_descriptor(&c)==42 && c.descriptor.flags==FD_CLOEXEC);
+    md_fd_view_publish(&c.descriptor,MD_FD_VIEW_RESULT,0,S_IFREG);
     c.native.number=SYS_openat; c.native.result=42;
     for (unsigned state=MD_NATIVE_EMPTY;state<=MD_NATIVE_CANCELLED;++state) {
         atomic_store(&c.native.state,state);
-        assert(md_entry_regular_descriptor(&c)==(state==MD_NATIVE_DONE ? 42 : -1));
+        assert(md_entry_view_descriptor(&c)==(state==MD_NATIVE_DONE ? 42 : -1));
     }
     atomic_store(&c.native.state,MD_NATIVE_DONE);
-    c.native.result=-ENOENT; assert(md_entry_regular_descriptor(&c)==-1);
-    c.native.result=INT64_MAX; assert(md_entry_regular_descriptor(&c)==-1);
-    c.native.result=42; c.native.number=SYS_close; assert(md_entry_regular_descriptor(&c)==-1);
-    c.native.number=SYS_openat; atomic_store(&c.native_regular,0);
-    assert(md_entry_regular_descriptor(&c)==-1);
+    c.native.result=-ENOENT; assert(md_entry_view_descriptor(&c)==-1);
+    c.native.result=INT64_MAX; assert(md_entry_view_descriptor(&c)==-1);
+    c.native.result=42; c.native.number=SYS_close; assert(md_entry_view_descriptor(&c)==-1);
+    c.native.number=SYS_openat; md_fd_view_revoke(&c.descriptor);
+    assert(md_entry_view_descriptor(&c)==-1);
+    uint64_t args[6]={42,FIONREAD,0};
+    assert(md_fd_view_query(SYS_ioctl,args,S_IFREG));
+    assert(!md_fd_view_query(SYS_ioctl,args,S_IFCHR));
+    assert(!md_fd_view_query(SYS_ioctl,args,S_IFIFO));
+    args[1]=F_GETFL;
+    assert(md_fd_view_query(SYS_fcntl,args,S_IFIFO));
     puts("PASS native descriptor lease: exact FD or successful open, cancellation, failure and revocation");
 }
 static pthread_barrier_t phase;
@@ -236,12 +291,12 @@ static void *publish(void *unused) {
     (void)unused;
     for (unsigned i=0;i<2000;++i) {
         barrier();
-        if (i&1) atomic_store_explicit(&channel.state,MD_ENTRY_REQUEST,memory_order_seq_cst);
+        if (i&1) atomic_store(&wake_requested,md_entry_publish_request(&channel,MD_ENTRY_REQUEST));
         else {
             atomic_store_explicit(&channel.native.state,MD_NATIVE_DONE,memory_order_release);
             atomic_thread_fence(memory_order_seq_cst);
         }
-        atomic_store(&wake_requested,!atomic_load_explicit(&channel.awake,memory_order_seq_cst));
+        if (!(i&1)) atomic_store(&wake_requested,!atomic_load_explicit(&channel.awake,memory_order_seq_cst));
         barrier();
     }
     return NULL;
@@ -251,12 +306,14 @@ static void park_handoff(void) {
     pthread_t peer; assert(!pthread_create(&peer,NULL,publish,NULL));
     for (unsigned i=0;i<2000;++i) {
         atomic_store(&channel.state,MD_ENTRY_IDLE); atomic_store(&channel.native.state,MD_NATIVE_EMPTY);
-        atomic_store(&channel.awake,1); atomic_store(&wake_requested,0);
-        barrier(); unsigned pending=md_entry_prepare_wait(&channel); barrier();
+        enum md_entry_owner owner=(i%4)==3 ? MD_ENTRY_SUPERVISOR_OWNER : MD_ENTRY_WORKER_OWNER;
+        channel.call.reserved=owner==MD_ENTRY_SUPERVISOR_OWNER ? MD_ENTRY_BUFFER_CONTROL : MD_ENTRY_SYSCALL;
+        atomic_store(md_entry_owner_awake(&channel,owner),1); atomic_store(&wake_requested,0);
+        barrier(); unsigned pending=md_entry_prepare_wait(&channel,owner); barrier();
         assert((pending&(i&1 ? MD_ENTRY_PENDING_CALL : MD_ENTRY_PENDING_NATIVE)) || atomic_load(&wake_requested));
     }
     assert(!pthread_join(peer,NULL) && !pthread_barrier_destroy(&phase));
-    puts("PASS worker park: 2000 concurrent request/completion handoffs cannot lose both readiness and wake");
+    puts("PASS exchange park: 2000 worker/supervisor request/completion handoffs cannot lose both readiness and wake");
 }
 int main(void) {
     alarm(30); unsigned count=0;
@@ -264,7 +321,7 @@ int main(void) {
     string_operands();
     open_admission();
     park_handoff();
-    for (int kind=0;kind<7;++kind)
+    for (int kind=0;kind<11;++kind)
         for (uintptr_t pc=(uintptr_t)md_cooperative_native;pc<=(uintptr_t)md_cooperative_native_end;pc+=4) {
             boundary(pc,kind); ++count;
         }

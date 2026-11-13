@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "proc_control.h"
 #include "control_ioctl.h"
+#include "descriptor_capture.h"
+#include "fd_capture.h"
 #include "file_metadata.h"
 #include "proc_file.h"
 #include "fd_filter.h"
@@ -30,32 +32,34 @@ long md_proc_control_known(int fd) {
     return kind==MD_DESCRIPTOR_ANONYMOUS ? 0 : kind;
 #endif
 }
-static long control_open(unsigned operation, int process, int selector, int flags, uint64_t view,const char *interface) {
-    long memory=0;
+static long control_request(void *memory,unsigned operation,int process,unsigned selector,
+        unsigned flags,uint64_t view,const char *interface,int publish) {
 #ifndef MD_USE_LIBC
-    if (interface) {
-        memory=md_adapter_buffer_take();
-        if (memory<0) return memory;
-        if (interface) memcpy((void *)memory,interface,16);
-    }
-#endif
-    long fd=RAW6(prctl,MD_GUEST_PROC_FILE,operation,process,selector,flags,view);
-#ifndef MD_USE_LIBC
-    if (fd==MD_PROC_OPEN_RIGHTS) {
-        if (!memory) memory=md_adapter_buffer_take();
-        fd=memory<0 ? memory : md_adapter_receive_fd((void *)memory,(unsigned)flags,MD_BUFFER_PROC_RIGHTS);
-    }
-    if (memory>0) {
-        long released=md_adapter_buffer_release();
-        if (released<0) { if (fd>=0) RAW1(close,fd); return released; }
-    }
+    struct md_proc_open_request *q=memory;
+    *q=(struct md_proc_open_request){.operation=operation,.process=process,
+        .selector=selector,.flags=flags,.view=view};
+    if (interface) memcpy(q->interface,interface,sizeof(q->interface));
+    long result=md_guest_buffer_control(MD_BUFFER_PROC_OPEN,0,0);
+    return !result && publish ? md_guest_buffer_result(flags,0,memory) : result;
 #else
-    (void)memory; (void)interface;
+    (void)memory; (void)operation; (void)process; (void)selector; (void)flags;
+    (void)view; (void)interface; (void)publish; return -ENOTSUP;
 #endif
-    if (fd<0) return fd;
-    long result=md_fd_filter_arm(MD_FD_SELECTOR_PROC,(int)fd);
-    if (result<0) { RAW1(close,fd); return result; }
+}
+static long control_open(unsigned operation,int process,int selector,int flags,uint64_t view,const char *interface) {
+#ifndef MD_USE_LIBC
+    long memory=md_adapter_buffer_take();
+    if (memory<0) return memory;
+    long fd=control_request((void *)memory,operation,process,(unsigned)selector,(unsigned)flags,view,interface,1);
+    long released=md_adapter_buffer_release();
+    if (released<0) { if (fd>=0) RAW1(close,fd); return released; }
     return fd;
+#else
+    return control_request(NULL,operation,process,(unsigned)selector,(unsigned)flags,view,interface,1);
+#endif
+}
+long md_proc_control_pidfd(void *memory,int fd,unsigned command) {
+    return control_request(memory,MD_PROC_FILE_PIDFD_NAMESPACE,fd,command,O_CLOEXEC,0,NULL,1);
 }
 long md_proc_control_open(const struct md_proc_path *ref, int flags, uint64_t view) {
     enum md_proc_kind kind=ref->kind==MD_PROC_FOREIGN ? ref->foreign_kind : ref->kind;
@@ -103,7 +107,7 @@ long md_proc_control_link_metadata(const struct md_proc_path *ref,long nr,const 
                 .f_bsize=md_page_size,.f_namelen=255,.f_frsize=md_page_size};
             result=md_write_memory((void *)a[1],&value,sizeof(value));
         } else if (nr==SYS_readlinkat) {
-            if (!namespace) result=kind==MD_PROC_FD ? -EXDEV : -EINVAL;
+            if (!namespace) result=kind==MD_PROC_FD ? -EXDEV : kind==MD_PROC_NONE ? -ENOENT : -EINVAL;
             else if (kind==MD_PROC_NONE && !S_ISLNK(st.st_mode)) result=-EINVAL;
             else if (!a[3]) result=-EINVAL;
             /* A namespace opened through a bind mount has a retained pathname,
@@ -149,32 +153,23 @@ long md_proc_control_call(long nr, const unsigned long *a, int kind) {
         long memory=md_adapter_buffer_take();
         if (memory<0) return memory;
         long result=md_guest_buffer_control(MD_BUFFER_CONTROL_MAP,0,0);
-        if (!result) {
-            extern long md_guest_task_control(void);
-            result=md_guest_task_control();
-        }
+        if (!result) result=md_guest_buffer_control(MD_BUFFER_MEMORY_MAP,0,0);
         long released=md_adapter_buffer_release();
         return result<0 ? result : released<0 ? released : result;
     }
     if (nr==SYS_ioctl) {
         if (!md_proc_file_namespace((enum md_proc_file_kind)kind)) {
-            long packed=md_guest_buffer_control(MD_BUFFER_CONTROL_IOCTL_SPEC,0,0);
-            if (packed<0) return packed;
-            size_t size=(uint32_t)packed;
-            unsigned direction=(unsigned)((uint64_t)packed>>32);
-            if (size>MD_CONTROL_IOCTL_MAX || direction&~(MD_CONTROL_IN|MD_CONTROL_OUT|MD_CONTROL_STRING|MD_CONTROL_INDIRECT)) return -EPROTO;
-            long memory=md_adapter_buffer_take();
-            if (memory<0) return memory;
-            struct md_control_ioctl layout={.size=(unsigned)size,.direction=direction};
-            long result=0;
-            if (direction&MD_CONTROL_INDIRECT) {
-                result=md_guest_buffer_control(MD_BUFFER_CONTROL_IOCTL_LAYOUT,0,0);
-                if (!result) {
-                    memcpy(&layout,(void *)memory,sizeof(layout));
-                    result=md_control_ioctl_size(&layout);
-                    if (result>=0) result=layout.size!=size || layout.direction!=direction ? -EPROTO : 0;
-                }
+            struct md_adapter_input input=md_adapter_buffer_begin(MD_BUFFER_CONTROL_IOCTL_LAYOUT,0);
+            if (!input.buffer) return input.value;
+            long memory=(long)input.buffer,result=input.value;
+            struct md_control_ioctl layout={0};
+            if (!result) {
+                memcpy(&layout,input.buffer,sizeof(layout));
+                result=md_control_ioctl_size(&layout);
+                if (result>=0) result=0;
             }
+            size_t size=layout.size;
+            unsigned direction=layout.direction;
             uintptr_t addresses[MD_CONTROL_IOCTL_FIELDS]={0};
             size_t lengths[MD_CONTROL_IOCTL_FIELDS]={0};
             if (!result) {
@@ -194,7 +189,17 @@ long md_proc_control_call(long nr, const unsigned long *a, int kind) {
                     result=md_read_memory((char *)memory+offset,(void *)addresses[i],lengths[i]);
                 offset+=f->capacity;
             }
-            if (!result) result=md_guest_buffer_control(MD_BUFFER_CONTROL_IOCTL,0,0);
+            if (!result && (direction&MD_CONTROL_FD)) {
+                int number; memcpy(&number,(char *)memory+layout.descriptor,sizeof(number));
+                struct md_fd_capture_frame *frame=(void *)((char *)memory+md_control_ioctl_capture_offset(&layout));
+                const struct md_descriptor_capture_protocol protocol={.admit=MD_BUFFER_CONTROL_CAPTURE_ADMIT,
+                    .ready=MD_BUFFER_CONTROL_CAPTURE_READY,.sent=MD_BUFFER_CONTROL_CAPTURE_SENT,
+                    .observed=MD_BUFFER_CONTROL_CAPTURE_OBSERVED};
+                result=md_guest_buffer_control(MD_BUFFER_CONTROL_CAPTURE,0,0);
+                if (result>0) result=md_descriptor_capture_inputs(result,frame,&number,1,&protocol);
+            }
+            if (!result && !md_control_ioctl_constant(&layout,(void *)memory))
+                result=md_guest_buffer_control(MD_BUFFER_CONTROL_IOCTL,0,0);
             offset=size;
             for (unsigned i=0;result>=0 && i<layout.fields;++i) {
                 const struct md_control_ioctl_field *f=&layout.field[i];
@@ -210,21 +215,23 @@ long md_proc_control_call(long nr, const unsigned long *a, int kind) {
                 long error=md_write_memory((void *)a[2],(void *)memory,size);
                 if (error) result=error;
             }
-            long released=md_adapter_buffer_release();
-            return result<0 ? result : released<0 ? released : result;
+            return md_adapter_buffer_finish(0,result);
         }
-        long value=RAW5(prctl,MD_GUEST_PROC_FILE,MD_PROC_FILE_NAMESPACE_QUERY,a[0],a[1],0);
+        long memory=md_adapter_buffer_take();
+        if (memory<0) return memory;
+        int publish=a[1]==NS_GET_USERNS || a[1]==NS_GET_PARENT;
+        long value=control_request((void *)memory,MD_PROC_FILE_NAMESPACE_QUERY,(int)a[0],
+            (unsigned)a[1],publish ? O_CLOEXEC : 0,0,NULL,publish);
+        long released=md_adapter_buffer_release();
+        if (released<0) { if (publish && value>=0) RAW1(close,value); return released; }
         if (value>=0 && a[1]==NS_GET_OWNER_UID) {
             uint32_t uid=(uint32_t)value;
             return md_write_memory((void *)a[2],&uid,sizeof(uid));
         }
-        if (value>=0 && (a[1]==NS_GET_USERNS || a[1]==NS_GET_PARENT)) {
-            long armed=md_fd_filter_arm(MD_FD_SELECTOR_PROC,(int)value);
-            if (armed<0) { RAW1(close,value); return armed; }
-        }
         return value;
     }
     int sysctl=md_proc_file_sysctl((enum md_proc_file_kind)kind);
+    int oom=md_proc_file_oom((enum md_proc_file_kind)kind);
     int control=kind==MD_PROC_FILE_CONTROL;
     struct md_proc_io_spec spec;
     long decoded=md_proc_io_decode(nr,a,&spec);
@@ -294,8 +301,11 @@ long md_proc_control_call(long nr, const unsigned long *a, int kind) {
         while (first<count && !vectors[first].iov_len) ++first;
         vectors[0]=vectors[first]; count=1; total=vectors[0].iov_len;
     }
+    /* Retain the original count for request validation; the proc handler only
+     * consumes its bounded prefix, including on oversized writes. */
+    if (writing && oom && total>31) vectors[0].iov_len=31;
     _Static_assert(sizeof(struct md_fs_buffer_frame)>=MD_CONTROL_IO_MAX,"control IO fits adapter buffer");
-    if (writing && !sysctl && !control && total>md_page_size-1) return -EINVAL;
+    if (writing && !sysctl && !control && !oom && total>md_page_size-1) return -EINVAL;
     long memory, result=0;
     int ready=!writing;
     if (writing) {

@@ -17,22 +17,25 @@ public final class ControlActivity extends Activity
         implements PhoneControlPanelController.Actions,
         MagicDeskSessionHost {
     private static final int REQUEST_NOTIFICATIONS = 1;
+    private static final String EXTRA_PANEL_ACTION = "panelAction";
+    enum LaunchAction { PANEL, CONSOLE, BLACK_SCREEN, TOUCHPAD }
     private static WeakReference<ControlActivity> sActive =
             new WeakReference<>(null);
+    private static java.util.concurrent.CompletableFuture<Boolean> sBlackScreenRequest;
 
     private final Handler mMainHandler = new Handler(Looper.getMainLooper());
     private final PlatformProjectionDriver mProjection =
             PlatformDrivers.current().projection();
-    private final PlatformPhoneUiDriver mPhoneUi =
-            PlatformDrivers.current().phoneUi();
 
     private PhoneControlPanelController mPanel;
+    private BlackScreenMode mBlackScreen;
     private MagicDeskSessionController mSessionController;
     private DisplayManager mDisplayManager;
     private DisplayManager.DisplayListener mDisplayListener;
     private SessionProfile mSessionProfile;
     private boolean mStartupAuditRunning;
     private boolean mStartupPrepared;
+    private boolean mResumed;
     private Runnable mStartupRequest;
     private boolean mReturnToPanelAfterWirelessConnection;
     private boolean mWirelessConnectionUiAvailable;
@@ -59,6 +62,14 @@ public final class ControlActivity extends Activity
                         | Intent.FLAG_ACTIVITY_SINGLE_TOP);
     }
 
+    static Intent createLaunchIntent(final android.content.Context context, final LaunchAction action) {
+        // Notification actions reset only the dedicated panel task, including its modal dialogs.
+        // Terminal windows and PTYs have independent lifetimes.
+        return createLaunchIntent(context).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                .setAction(BuildConfig.APPLICATION_ID + ".control." + action.name())
+                .putExtra(EXTRA_PANEL_ACTION, action.name());
+    }
+
     @Override
     protected void onCreate(final Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -69,6 +80,10 @@ public final class ControlActivity extends Activity
         }
         mSessionProfile = SessionProfile.fromLaunchIntent(this, getIntent());
         initializeControlPanel();
+        if (savedInstanceState != null) {
+            // Android retains the original launch Intent across recreation, including consumed actions.
+            getIntent().putExtra(EXTRA_PANEL_ACTION, savedInstanceState.getString(EXTRA_PANEL_ACTION));
+        }
         ShellAccess.addStateListener(mAccessListener);
         DesktopSetupStatus.addListener(mSetupStatusListener);
         TermuxConnectionStatus.get().addListener(mSetupStatusListener);
@@ -78,6 +93,36 @@ public final class ControlActivity extends Activity
     protected void onNewIntent(final Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        applyLaunchAction();
+    }
+
+    @Override
+    protected void onSaveInstanceState(final Bundle state) {
+        super.onSaveInstanceState(state);
+        state.putString(EXTRA_PANEL_ACTION, getIntent().getStringExtra(EXTRA_PANEL_ACTION));
+    }
+
+    private void applyLaunchAction() {
+        final String action = getIntent().getStringExtra(EXTRA_PANEL_ACTION);
+        if (action == null || !mResumed || !hasWindowFocus() || isActivityUnavailable()
+                || mBlackScreen == null || getDisplay() == null
+                || getDisplay().getDisplayId() != Display.DEFAULT_DISPLAY) return;
+        final var keyguard = getSystemService(android.app.KeyguardManager.class);
+        if (keyguard == null || keyguard.isKeyguardLocked()) return;
+        getIntent().removeExtra(EXTRA_PANEL_ACTION);
+        if (sBlackScreenRequest != null && !sBlackScreenRequest.isDone()) {
+            sBlackScreenRequest.completeExceptionally(
+                    new IllegalStateException("Control Panel action superseded black-screen request"));
+        }
+        sBlackScreenRequest = null;
+        mBlackScreen.exit();
+        if (LaunchAction.CONSOLE.name().equals(action)) {
+            TerminalSessions.resumeMostRecent(this);
+        } else if (LaunchAction.BLACK_SCREEN.name().equals(action)) {
+            openBlackScreen();
+        } else if (LaunchAction.TOUCHPAD.name().equals(action)) {
+            openTouchpad();
+        }
     }
 
     private void runStartupAudit(final Runnable request) {
@@ -174,7 +219,8 @@ public final class ControlActivity extends Activity
         mStatus = getString(DesktopRuntimeBridge.hasWorkspaces()
                 ? R.string.control_status_desktop_active
                 : R.string.control_status_ready);
-        setContentView(mPanel.createView());
+        mBlackScreen = new BlackScreenMode(getWindow(), mPanel.createView());
+        setContentView(mBlackScreen.view());
         registerDisplayListener();
         refreshCatalog();
         refresh();
@@ -187,6 +233,7 @@ public final class ControlActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
+        mResumed = true;
         DesktopSetupStatus.refresh(this);
         DesktopAutomationEventJournal.record(
                 "ui", "control_panel_shown", true, "phone");
@@ -200,17 +247,47 @@ public final class ControlActivity extends Activity
             refreshCatalog();
         }
         refresh();
+        applyLaunchAction();
     }
 
     @Override
     protected void onPause() {
+        mResumed = false;
+        if (mBlackScreen != null) mBlackScreen.exit();
         DesktopAutomationEventJournal.record(
                 "ui", "control_panel_hidden", true, "phone");
         super.onPause();
     }
 
+    @Override public void openBlackScreen() {
+        mBlackScreen.enter();
+    }
+
+    @Override public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && mBlackScreen != null) {
+            applyLaunchAction();
+            applyBlackScreenRequest();
+            mBlackScreen.hideBars();
+        }
+    }
+
+    @Override public boolean dispatchKeyEvent(android.view.KeyEvent event) {
+        return mBlackScreen != null && mBlackScreen.dispatchKeyEvent(event)
+                || super.dispatchKeyEvent(event);
+    }
+
+    @Override public boolean dispatchTouchEvent(android.view.MotionEvent event) {
+        return mBlackScreen != null && mBlackScreen.active() || super.dispatchTouchEvent(event);
+    }
+
+    @Override public boolean dispatchGenericMotionEvent(android.view.MotionEvent event) {
+        return mBlackScreen != null && mBlackScreen.active() || super.dispatchGenericMotionEvent(event);
+    }
+
     @Override
     protected void onDestroy() {
+        if (mBlackScreen != null) mBlackScreen.exit();
         ShellAccess.removeStateListener(mAccessListener);
         DesktopSetupStatus.removeListener(mSetupStatusListener);
         TermuxConnectionStatus.get().removeListener(mSetupStatusListener);
@@ -237,6 +314,47 @@ public final class ControlActivity extends Activity
         return activity != null
                 && !activity.isActivityUnavailable()
                 && activity.hasWindowFocus();
+    }
+
+    /** Main-thread request; entering also brings the existing phone panel forward. */
+    static void requestBlackScreen(boolean enabled, java.util.concurrent.CompletableFuture<Boolean> result) {
+        if (Looper.myLooper() != Looper.getMainLooper()) throw new IllegalStateException("Main thread required");
+        if (result.isDone()) return;
+        if (sBlackScreenRequest != null && !sBlackScreenRequest.isDone())
+            sBlackScreenRequest.completeExceptionally(new IllegalStateException("Black-screen request superseded"));
+        sBlackScreenRequest = null;
+        var activity = sActive.get();
+        if (!enabled) {
+            if (activity != null && activity.mBlackScreen != null) activity.mBlackScreen.exit();
+            result.complete(false);
+            return;
+        }
+        var context = MagicDeskApplication.applicationContext();
+        var power = context.getSystemService(android.os.PowerManager.class);
+        var keyguard = context.getSystemService(android.app.KeyguardManager.class);
+        if (power == null || !power.isInteractive() || keyguard == null || keyguard.isKeyguardLocked()) {
+            result.completeExceptionally(new IllegalStateException("Unlock and wake the phone before enabling black-screen mode"));
+            return;
+        }
+        sBlackScreenRequest = result;
+        if (!PhoneControlPanelLauncher.openWithAndroidApi(context))
+            result.completeExceptionally(new IllegalStateException("Could not open the phone Control Panel"));
+        if (activity != null) activity.applyBlackScreenRequest();
+    }
+
+    private void applyBlackScreenRequest() {
+        var request = sBlackScreenRequest;
+        if (request == null || request.isDone() || !hasWindowFocus() || isActivityUnavailable()
+                || getDisplay() == null || getDisplay().getDisplayId() != Display.DEFAULT_DISPLAY || mBlackScreen == null) return;
+        sBlackScreenRequest = null;
+        mBlackScreen.enter();
+        mBlackScreen.confirmFrame(request);
+    }
+
+    static boolean blackScreenEnabled() {
+        var activity = sActive.get();
+        return activity != null && !activity.isActivityUnavailable() && activity.mBlackScreen != null
+                && activity.mBlackScreen.active();
     }
 
     static void refreshInputState() {
@@ -420,35 +538,60 @@ public final class ControlActivity extends Activity
 
     @Override
     public void openTouchpad() {
+        if (!PhoneTouchpadController.canOpen()) {
+            refresh();
+            return;
+        }
         mStatus = getString(R.string.status_touchpad_opening);
         refresh();
         PhoneTouchpadController.open();
     }
 
-    @Override
-    public void togglePhoneScreen() {
+    @Override public void openGraphics() {
+        ToolApplications.open(this, ToolApplications.intent(this, "graphics"),
+                ToolLaunchTarget.resolve("phone", 0, java.util.Set.of()), null,
+                error -> { if (error != null) runOnUiThread(() -> {
+                    if (!isActivityUnavailable()) {
+                        mStatus = ShellAccess.usefulMessage(error);
+                        refresh();
+                    }
+                }); });
+    }
+
+    @Override public void showScreenPowerOptions() {
+        if (!ShellAccess.isReady()) {
+            showAccessInfo();
+            return;
+        }
+        PhoneDisplayGuard.checkAvailable(available -> runOnUiThread(() -> {
+            if (isActivityUnavailable() || !hasWindowFocus()) return;
+            if (!available && !PhoneDisplayGuard.isScreenOff()) {
+                mStatus = getString(R.string.phone_panel_unavailable);
+                refresh();
+                return;
+            }
+            boolean off = !PhoneDisplayGuard.isScreenOff();
+            UiDialogs.builder(this).setItems(new String[] {getString(off
+                            ? R.string.phone_panel_power_off : R.string.action_phone_screen_on)},
+                    (dialog, which) -> setPhoneScreenOff(off)).show();
+        }));
+    }
+
+    private void setPhoneScreenOff(boolean screenOff) {
         if (!ShellAccess.isReady()) {
             return;
         }
-        final boolean screenOff =
-                !mPhoneUi.isPhoneScreenOff(this);
         mStatus = getString(R.string.status_phone_screen_applying);
         refresh();
-        DesktopOperations.setPhoneScreenOff(
+        PhoneDisplayGuard.setScreenOff(
                 screenOff,
                 success -> runOnUiThread(() -> {
                     if (isActivityUnavailable()) {
                         return;
                     }
-                    final int result;
-                    if (!success) {
-                        result = R.string.status_phone_screen_failed;
-                    } else if (screenOff) {
-                        result = R.string.status_phone_screen_off;
-                    } else {
-                        result = R.string.status_phone_screen_on;
-                    }
-                    mStatus = getString(result);
+                    mStatus = getString(!success ? R.string.status_phone_screen_failed
+                            : DesktopRuntimeBridge.hasWorkspaces() ? R.string.control_status_desktop_active
+                            : R.string.control_status_ready);
                     if (!success) {
                         CompatibilityDiagnostics.record(
                                 "PHONE-SCREEN-001",
@@ -610,18 +753,14 @@ public final class ControlActivity extends Activity
             return;
         }
         final java.util.Set<Integer> desktopDisplays = DesktopRuntimeBridge.workspaceDisplayIds();
-        final boolean externalDesktopActive = desktopDisplays.stream().anyMatch(id -> id > 0);
         mPanel.render(new PhoneControlPanelController.State(
                 mDisplays, mTasks, desktopDisplays, mDisplayOperation,
                 mSessionController.isOperationInProgress(),
-                externalDesktopActive,
                 ShellAccess.isReady(),
-                mPhoneUi.isPhoneScreenOff(this),
-                ShellAccess.isReady() && mPhoneUi.isAvailable(),
                 mProjection.supportsOutputConfiguration(),
                 mWirelessConnectionUiAvailable,
                 RuntimeLimits.restartRequired(this) ? getString(R.string.access_restart_required)
-                        : mStatus,
+                        : PhoneDisplayGuard.isScreenOff() ? getString(R.string.status_phone_screen_off) : mStatus,
                 ShellAccess.currentSnapshot().accessLabel(), TermuxIntegration.inspect(this),
                 RuntimeCapabilities.current(this)));
     }

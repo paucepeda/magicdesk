@@ -5,9 +5,11 @@ or a claim that all tests are automated. Keep every distribution printed by
 `sh scripts/install_linux.sh --list` in every table. Results do not transfer
 between distributions sharing a package manager, libc or init system.
 
-Last reconciled: 2026-11-03. Current device evidence uses NX809J, Android 16,
+Last reconciled: 2026-11-07. Current device evidence uses NX809J, Android 16,
 Linux 6.12.23, 4 KiB pages and Android shell UID 2000. This does not cover the
 minimum supported kernel 5.15, other firmware or Android root execution.
+App-UID acceptance is recorded in [host execution](host-execution.md); these
+Shell table cells do not implicitly certify User installations.
 
 - [Reading Results](#reading-results)
 - [Linux 5.15 Capability Profile](#linux-515-capability-profile)
@@ -16,6 +18,7 @@ minimum supported kernel 5.15, other firmware or Android root execution.
 - [Packaged Browsers And Portals](#packaged-browsers-and-portals)
 - [Desktop And Development](#desktop-and-development)
 - [Added System Workloads](#added-system-workloads)
+- [K3s](#k3s)
 - [Evidence And Open Work](#evidence-and-open-work)
 
 ## Reading Results
@@ -148,9 +151,11 @@ Cell order: **Shroot (lazy SVC) / Base**; N = not run.
 
 Package lifecycle means install, update/reinstall, verification and removal,
 including transaction hooks. A zero package-manager exit with failed hooks is
-not a pass. SteamOS default boot passes on a private bridge but retains the
-routed host-port restriction and unsupported firewalld rules documented in its
-[evidence](distribution-evidence.md#steamos-recipedefault-boot).
+not a pass. SteamOS default boot uses a private bridge; routed host-port
+publication has the Android permission restriction documented in its
+[evidence](distribution-evidence.md#steamos-recipedefault-boot). Current App-UID
+boot and firewalld acceptance is recorded separately in
+[host execution](host-execution.md#steamos-user-open-work); it does not promote these Shell cells.
 Focused control-target tests do not certify a healthy default target.
 Ubuntu reaches a healthy default target, but its packaged LXC and Podman
 shutdown units return errors with empty container lists; see the
@@ -189,16 +194,20 @@ All runs use default lazy entry; Base remains untested in this batch.
 Fedora and openSUSE required their separately packaged networkd, installed in
 the lab from their own repositories before the passing rerun. This does not
 replace openSUSE's Wicked or add a test-only dependency to the user recipe.
-SteamOS firewalld still submits unsupported UDP/ICMP REJECT rules.
+SteamOS's current shared firewall implementation admits its inet REJECT rules
+and ordered port comparisons. The App-UID boot receipt below verifies rule
+addition/removal and restarts; the Shell boot row above has not been rerun.
 (*) Armtix's 2026-10-24 boot receipt is under `build/compat-contract-tests/`:
 stock runit stages, service start/restart/stop and launch cleanup pass without
 startup failures. Its root remount uses the documented persistent-store contract.
-Current focused service receipts under `build/boot-service-repair/`:
-`a90f1ba5666a4fe987381e65d4bb3f37` verifies SteamOS Avahi mDNS over IPv4/IPv6
-and three restart cycles. `0553d599fba34bf2ba48e0262789fb0d` verifies Ubuntu
+Current service receipts:
+`build/matrix-close-steamos/boot-handles/oci-services-bf17fdb74ade4dfabbfa36dd79153142.json`
+verifies SteamOS default boot under App UID, Avahi mDNS over IPv4/IPv6,
+firewalld nft rule addition/removal, three restart cycles, binfmt, RTKit and
+clean shutdown. `build/boot-service-repair/oci-services-0553d599fba34bf2ba48e0262789fb0d.json` verifies Ubuntu
 default-target startup, journal/D-Bus/logind IO and three CUPS IPP restart
-cycles within the unchanged five-second readiness bound. These receipts do
-not certify SteamOS firewalld or unrelated Ubuntu container-service shutdown.
+cycles within the unchanged five-second readiness bound. That Ubuntu receipt
+does not certify unrelated container-service shutdown.
 
 ### NixOS Recipe And Initial-Image Probes
 
@@ -315,6 +324,36 @@ Cell order: **Shroot (lazy SVC) / Base**; N = not run.
 | steamos | P/N | P/N | B/N | P/N |
 
 ### K3s
+
+K3s is required in the selected matrix for **every recipe OS**, independently
+for Shell and User. Reuse `test_k3s.py`; an init system or package manager does
+not exclude a recipe. Missing test prerequisites remain B, never NA by default.
+The paired cells retain lazy/Base entry results. Cluster receipts below qualify
+only their named topology and host profile, not untested configurations.
+The process fixture uses the normal Linux service umask `022`; Shroot itself
+preserves the caller's mask, including Android's private app mask.
+
+| Recipe ID | Shell | User |
+| --- | --- | --- |
+| debian | P/N | P/N |
+| ubuntu | N/N | P/N |
+| alpine | P/N | P/N |
+| fedora | N/N | P/N |
+| arch | N/N | P/N |
+| opensuse | N/N | P/N |
+| openkylin | N/N | P/N |
+| deepin | N/N | P/N |
+| manjaro | N/N | P/N |
+| void | N/N | N/N |
+| armtix | N/N | P/N |
+| nixos | N/N | P/N |
+| steamos | N/N | P/N |
+
+Distribution-specific User acceptance and separate persistent boot/recovery
+results are recorded in
+[host execution](host-execution.md#qualifying-evidence). A passing boot/recovery
+run does not replace workload lifecycle acceptance. The following receipts are
+Shell results; they do not certify User or another distribution.
 
 The qualified binary is stock ARM64 k3s v1.37.1+k3s1, running as
 guest root under shell UID 2000, with stock container seccomp enabled. Passing
@@ -576,6 +615,18 @@ This ledger retains current acceptance evidence and unresolved blockers, not
 the history of repaired defects. Replace a failed status after a qualifying
 rerun and remove its resolved explanation. Regression coverage belongs in the
 tests. Local report paths identify evidence, not durable public downloads.
+An older failure with an unknown cause does not by itself block a passing
+status after qualifying reruns of the same scenario; retain its logs in run
+artifacts, not as an active defect unless it recurs.
+
+User-executor coverage uses existing recipe stores through the borrowed-store
+fixture rather than creating copies. Per-distribution scope and remaining
+failures are recorded in [host execution](host-execution.md#qualifying-evidence),
+including init/service lifecycle, containers and virtual machines, k3s,
+packaged browsers/portals, VS Code and recipe desktop workflows.
+Keep User evidence separate from the Shell results above. Shared runtime
+fixes require focused Shell regressions, not an implicit rerun or promotion of
+the entire Shell matrix.
 
 Detailed receipts are grouped in [Distribution acceptance evidence](distribution-evidence.md):
 

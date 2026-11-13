@@ -41,7 +41,9 @@ public class GuestRuntimeTest {
                 "--cwd", "/guest/c d", "--", "/bin/sh", "-c", "echo '$HOME'"), plan.arguments());
         GuestLaunchPlan.requireIdentity(2000);
         GuestLaunchPlan.requireIdentity(0);
-        for (int uid : List.of(10000, -1)) assertThrows(IllegalStateException.class, () -> GuestLaunchPlan.requireIdentity(uid));
+        for (int uid : List.of(10000, 19999, 110000, 119999)) GuestLaunchPlan.requireIdentity(uid);
+        for (int uid : List.of(1000, 9999, 20000, 99000, -1))
+            assertThrows(IllegalStateException.class, () -> GuestLaunchPlan.requireIdentity(uid));
     }
 
     @Test public void rejectsIncompleteAndAmbiguousPlans() {
@@ -200,6 +202,8 @@ public class GuestRuntimeTest {
             builder.environment().put("PATH", tools + ":" + System.getenv("PATH"));
             builder.environment().put("MAGICDESK_GRAPHICS_ENDPOINT", "opaque ' endpoint");
             builder.environment().put("DISPLAY", ":37");
+            builder.environment().put("MAGICDESK_TOOLS", tools.toString());
+            builder.environment().put("MAGICDESK_ANDROID_SHELL", "sh");
             var process = builder.start();
             String[] arguments = new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).split("\n");
             assertEquals(0, process.waitFor());
@@ -224,6 +228,8 @@ public class GuestRuntimeTest {
         builder.environment().put("PATH", tools + ":" + System.getenv("PATH"));
         builder.environment().put("MAGICDESK_GRAPHICS_ENDPOINT", "endpoint");
         builder.environment().put("MAGICDESK_GUEST_LIBRARIES", "/host/helpers");
+        builder.environment().put("MAGICDESK_TOOLS", tools.toString());
+        builder.environment().put("MAGICDESK_ANDROID_SHELL", "sh");
         builder.environment().put("MAGICDESK_GUEST_FILES_SOCKET", "files-socket");
         builder.environment().put("MAGICDESK_GUEST_FILES_TOKEN", "files-token");
         var process = builder.start();

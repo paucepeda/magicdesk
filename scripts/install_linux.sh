@@ -5110,6 +5110,12 @@ let
   selected = name: builtins.elem name settings.desktops;
   graphical = settings.desktops != [];
   turnip = settings.gpu == "turnip";
+  init = pkgs.runCommand "magicdesk-init" {} ''
+    mkdir -p $out/bin
+    cp ${./magicdesk-files/magicdesk-init} $out/bin/magicdesk-init
+    chmod +x $out/bin/magicdesk-init
+    patchShebangs $out/bin
+  '';
   tools = pkgs.runCommand "magicdesk-session-tools" {
     nativeBuildInputs = [ pkgs.bash pkgs.python3 ] ++ lib.optional turnip pkgs.stdenv.cc;
   } ''
@@ -5197,7 +5203,7 @@ in {
   services.openssh.enable = lib.mkOverride 900 false;
   system.stateVersion = lib.mkDefault "26.05";
   nix.settings = { max-jobs = 1; cores = settings.jobs; sandbox = true; };
-  environment.systemPackages = with pkgs; [ bashInteractive coreutils util-linux curl cacert git python3 iproute2 ]
+  environment.systemPackages = with pkgs; [ init bashInteractive coreutils util-linux curl cacert git python3 iproute2 ]
     ++ map (name: lib.attrByPath (lib.splitString "." name)
       (throw "Unknown Nix package attribute: ${name}") pkgs) settings.packages
     ++ lib.optionals graphical ([ tools mousepad thunar xfce4-terminal dbus
@@ -5450,6 +5456,11 @@ NIXOS_SETUP
     cat <<'NIXOS_SETUP'
 NIXOS_MODULE
 mv magicdesk.nix.new magicdesk.nix
+cat > magicdesk-files/magicdesk-init <<'NIXOS_INIT'
+NIXOS_SETUP
+    init_session
+    cat <<'NIXOS_SETUP'
+NIXOS_INIT
 cat > magicdesk-files/magicdesk-desktop-session <<'NIXOS_DESKTOP'
 NIXOS_SETUP
     desktop_session
@@ -5577,10 +5588,13 @@ NIXOS_SETUP
 init_prepare() {
     cat <<'MD_INIT_PREPARE'
 set -eu
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/nix/var/nix/profiles/system/sw/bin
 export container=shroot SYSTEMD_LOG_TARGET=console SYSTEMD_LOG_LEVEL=info
 export SYSTEMD_LOG_COLOR=0 SYSTEMD_PAGER=cat LANG=C.UTF-8
 test "$$" = 1
+# Init's shared API directories must not inherit Android's private app umask.
+umask 022
+mkdir -p /run /tmp /var/tmp
 # Preserve the launch-owned input provider across the private /run mount.
 udev_mount=
 if mountpoint -q /run/udev; then
@@ -5627,6 +5641,52 @@ ln -s /proc/self/fd/1 /dev/stdout
 ln -s /proc/self/fd/2 /dev/stderr
 umount -l /run/md-host-dev
 rmdir /run/md-host-dev
+# Recovery images with this initrd layout keep persistent /etc in /var.
+# Expose it before PID 1 loads units and generators, not at local-fs.target.
+if [ -f /usr/lib/initcpio/hooks/etc_overlay ] && ! mountpoint -q /etc; then
+    # Keep the launch-owned resolver reachable above the recovery overlay.
+    resolver_mount=
+    if mountpoint -q /etc/resolv.conf; then
+        resolver_mount=$(mktemp /run/md-init-resolver.XXXXXXXX)
+        mount --move /etc/resolv.conf "$resolver_mount"
+    fi
+    mkdir -p /var/lib/overlays/etc/upper /var/lib/overlays/etc/work
+    mount -t overlay -o lowerdir=/etc,upperdir=/var/lib/overlays/etc/upper,workdir=/var/lib/overlays/etc/work overlay /etc
+    if [ -n "$resolver_mount" ]; then
+        mount --move "$resolver_mount" /etc/resolv.conf
+        rm "$resolver_mount"
+    fi
+fi
+# Libvirt's host-wide AIO tuning is optional in a container. Keep the requested
+# value and every other setting; procps' '-' prefix tolerates only this write's
+# failure. Native AIO and the reported kernel limit remain unchanged. Runtime
+# policy never replaces an administrator's higher-priority /etc configuration.
+for directory in /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
+    [ -f "$directory/60-libvirtd.conf" ] || continue
+    mkdir -p /run/sysctl.d
+    awk '
+        /^[ \t]*fs[./]aio-max-nr[ \t]*=/ { sub(/^[ \t]*/, "-") }
+        { print }
+    ' "$directory/60-libvirtd.conf" > /run/sysctl.d/60-libvirtd.conf
+    break
+done
+# The launch configures eth0 without DHCP. Preserve that uplink when networkd
+# starts; earlier user profiles (or the same filename in /etc) can override it.
+mkdir -p /run/systemd/network
+cat > /run/systemd/network/80-magicdesk-uplink.network <<'EOF'
+[Match]
+Name=eth0
+[Network]
+DHCP=no
+IPv6AcceptRA=no
+LinkLocalAddressing=no
+KeepConfiguration=static
+EOF
+# Activation owns NixOS /etc and service links. Select the existing generation;
+# boot does not rebuild it or replace the user's declarative configuration.
+if [ -x /nix/var/nix/profiles/system/activate ]; then
+    /nix/var/nix/profiles/system/activate
+fi
 MD_INIT_PREPARE
 }
 
@@ -5639,14 +5699,20 @@ if [ "${1:-}" = --help ]; then
     echo 'Boot the installed init system with a guest-root console (or command).'
     exit 0
 fi
+init_command=
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/nix/var/nix/profiles/system/sw/bin
+for candidate in /sbin/openrc-init /usr/lib/systemd/systemd /lib/systemd/systemd /nix/var/nix/profiles/system/systemd/lib/systemd/systemd; do
+    if [ -x "$candidate" ]; then
+        init_command=$candidate
+        break
+    fi
+done
+[ -n "$init_command" ] || {
+    echo 'Install systemd or OpenRC to use magicdesk-init.' >&2; exit 1;
+}
 if [ "${1:-}" != --namespace-init ]; then
     [ "$(id -u)" = 0 ] || { echo 'Guest root is required for init.' >&2; exit 1; }
     tty >/dev/null || { echo 'Init requires a terminal; use script for a headless launch.' >&2; exit 1; }
-    if [ ! -x /sbin/openrc-init ]; then
-        [ -x /sbin/init ] && { [ -x /usr/lib/systemd/systemd ] || [ -x /lib/systemd/systemd ]; } || {
-            echo 'Install systemd or OpenRC to use magicdesk-init.' >&2; exit 1;
-        }
-    fi
     for tool in unshare mount mountpoint script; do
         command -v "$tool" >/dev/null || { echo "Missing init tool: $tool (install util-linux)." >&2; exit 1; }
     done
@@ -5661,7 +5727,11 @@ export PATH=/usr/local/sbin:/usr/local/bin:$PATH
 mount --make-rshared /
 # The caller already selected guest root. Retain that identity on the console;
 # do not change login policy or install a passwordless getty on other terminals.
-[ "$#" -gt 0 ] || set -- /bin/sh -l
+console_restart=no
+if [ "$#" = 0 ]; then
+    set -- /bin/sh -l
+    console_restart=always
+fi
 {
     printf '#!/bin/sh\nexec'
     for argument do
@@ -5677,7 +5747,7 @@ cat > /run/magicdesk-init-console <<'EOF'
 #!/bin/sh
 exec script -q -e -c 'exec /bin/sh /run/magicdesk-init-session' /dev/null </dev/console >/dev/console 2>&1
 EOF
-if [ -x /sbin/openrc-init ]; then
+if [ "$init_command" = /sbin/openrc-init ]; then
     # Scope container policy to this boot; preserve installed service enablement.
     cp /etc/rc.conf /run/rc.conf
     printf '\nrc_sys="docker"\n' >> /run/rc.conf
@@ -5689,31 +5759,40 @@ if [ -x /sbin/openrc-init ]; then
     fi
     # Keep the actual service directory/runlevels writable: installers must
     # persist newly installed services and their enablement across boots.
-    cat > /etc/init.d/magicdesk-session <<'EOF'
-#!/sbin/openrc-run
-supervisor=supervise-daemon
-command=/bin/sh
-command_args="/run/magicdesk-init-console"
+    {
+        printf '#!/sbin/openrc-run\n'
+        if [ "$console_restart" = always ]; then
+            printf 'supervisor=supervise-daemon\nrespawn_delay=1\n'
+        else
+            printf 'command_background=yes\n'
+        fi
+        cat <<'EOF'
+command=$(command -v script)
+command_args="-q -e -c 'exec /bin/sh /run/magicdesk-init-session' /dev/null"
+input_file=/dev/console
+output_log=/dev/console
+error_log=/dev/console
 pidfile=/run/magicdesk-session.pid
-respawn_delay=1
 start() { [ ! -f /run/magicdesk-init-session ] || default_start; }
 EOF
+    } > /etc/init.d/magicdesk-session
     chmod 755 /etc/init.d/magicdesk-session
     rc-update add magicdesk-session default
-    exec /sbin/openrc-init
+    exec "$init_command"
 fi
 mkdir -p /run/systemd/system/default.target.wants
-cat > /run/systemd/system/magicdesk-session.service <<'EOF'
+cat > /run/systemd/system/magicdesk-session.service <<EOF
 [Unit]
 After=basic.target
 Conflicts=shutdown.target console-getty.service
 Before=shutdown.target
 [Service]
+Environment="PATH=$PATH"
 ExecStart=/bin/sh /run/magicdesk-init-console
-Restart=always
+Restart=$console_restart
 EOF
 ln -s ../magicdesk-session.service /run/systemd/system/default.target.wants/
-exec /sbin/init
+exec "$init_command"
 MD_INIT_EXEC
 }
 
@@ -5814,17 +5893,25 @@ case "$family" in
     apk)
         refresh_packages
         packages ca-certificates bash coreutils util-linux tzdata musl-locales musl-locales-lang lang shadow ;;
-    dnf) packages ca-certificates bash coreutils util-linux tzdata glibc-langpack-en shadow-utils iptables-nft ;;
+    dnf)
+        packages ca-certificates bash coreutils util-linux tzdata glibc-langpack-en shadow-utils iptables-nft
+        # OCI bases can omit file capabilities even though RPM records them.
+        # Retain the package's narrow helper privileges, not a setuid override.
+        rpm --setcaps shadow-utils ;;
     zypper)
         refresh_packages
-        packages ca-certificates bash coreutils util-linux timezone glibc-locale glibc-i18ndata shadow iptables-backend-nft ;;
+        packages ca-certificates bash coreutils util-linux timezone glibc-locale glibc-i18ndata shadow iptables-backend-nft
+        rpm --setcaps shadow ;;
     xbps)
         refresh_packages
         packages ca-certificates bash coreutils util-linux tzdata glibc-locales shadow iptables-nft ;;
     pacman)
         arch_mirror_fallback /etc/pacman.d/mirrorlist
         refresh_packages
-        packages ca-certificates bash coreutils util-linux tzdata gzip ;;
+        packages ca-certificates bash coreutils util-linux tzdata gzip
+        # Rootfs archives may omit xattrs; --needed cannot repair file capabilities.
+        # Re-extract the package's own helper privileges, without setuid overrides.
+        pacman -S --noconfirm shadow </dev/null ;;
     recovery)
         refresh_packages
         dbus-uuidgen --ensure ;;
@@ -6510,9 +6597,9 @@ prepare_recovery() {
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 require_magicdesk_version() {
-    command -v magicdesk >/dev/null 2>&1 || fail 'magicdesk is unavailable. Open a MagicDesk Shell console first.'
+    command -v magicdesk >/dev/null 2>&1 || fail 'magicdesk is unavailable. Open a MagicDesk User or Shell console first.'
     installed_magicdesk_version_code=$(magicdesk get_state --field data.app.versionCode) || \
-        fail "Cannot determine MagicDesk version. Use MagicDesk $MIN_MAGICDESK_VERSION_NAME or newer and open a new Shell console."
+        fail "Cannot determine MagicDesk version. Use MagicDesk $MIN_MAGICDESK_VERSION_NAME or newer and open a new User or Shell console."
     case "$installed_magicdesk_version_code" in
         ''|*[!0-9]*) fail 'Invalid MagicDesk versionCode; expected a non-negative Android version code.' ;;
     esac
@@ -6520,7 +6607,7 @@ require_magicdesk_version() {
         fail 'Invalid MagicDesk versionCode; expected a non-negative Android version code.'
     fi
     [ "$installed_magicdesk_version_code" -ge "$MIN_MAGICDESK_VERSION_CODE" ] || \
-        fail "This installer requires MagicDesk $MIN_MAGICDESK_VERSION_NAME or newer (versionCode $MIN_MAGICDESK_VERSION_CODE; installed $installed_magicdesk_version_code). Update MagicDesk, open a new Shell console and try again."
+        fail "This installer requires MagicDesk $MIN_MAGICDESK_VERSION_NAME or newer (versionCode $MIN_MAGICDESK_VERSION_CODE; installed $installed_magicdesk_version_code). Update MagicDesk, open a new User or Shell console and try again."
 }
 ask() {
     printf '%s [%s]: ' "$1" "$2"
@@ -6650,7 +6737,7 @@ admin_exec() (
     admin_target=$1
     shift
     # exec retains image HOME; setup must use the selected account's home instead.
-    exec shroot login "$admin_target" --user root "$@"
+    shroot login "$admin_target" --user root "$@"
 )
 package_exec() (
     package_target=$1
@@ -6722,8 +6809,7 @@ if [ "$resume" = yes ]; then
     [ -z "$dns" ] && [ -z "$image" ] || fail '--resume retains image and DNS; use shroot dns to change DNS.'
 fi
 
-command -v shroot >/dev/null 2>&1 || fail 'Open a MagicDesk Shell console with shell access first.'
-case "$(id -u)" in 2000|0) ;; *) fail 'Shroot requires the selected Android shell (UID 2000) or root executor.' ;; esac
+command -v shroot >/dev/null 2>&1 || fail 'Open a MagicDesk User or Shell console with Shroot available first. This installer does not install PRoot environments.'
 require_magicdesk_version
 if [ "$yes" = no ]; then
     [ -t 0 ] || fail 'Interactive input is unavailable. Save the script before running it, or use --yes.'
@@ -6837,6 +6923,7 @@ if [ -n "$image" ]; then source_kind=oci; else image=$source; fi
 [ "$resume" = yes ] || check_dns
 
 printf '\n%s %s ARM64 | %s | GUI=%s | graphics=%s\n' "$distro" "$version" "$name" "$gui" "$gpu"
+printf 'Library: %s | runtime: Shroot (managed)\n' "${MAGICDESK_GUEST_HOME:-$HOME/linux}"
 printf 'Locale=%s | timezone=%s | fonts=%s | application entries=%s\n' "$locale_name" "$zone" "$fonts" "$protocol"
 printf 'Guest account=%s | extra packages=%s | package cache=%s\n' "${new_user:-unchanged}" "${extras:-none}" "$cache"
 if [ "$gpu" = turnip ] || [ "$gpu" = auto ] || [ "$gui" = plasma ] || [ "$gui" = weston ]; then

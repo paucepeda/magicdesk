@@ -5,9 +5,15 @@
 /* Private auxv contract, independent of the libc ABI. The caller retains its
  * original SVC instruction, including clone/signal-return stack semantics. */
 #define MD_AT_COOPERATIVE 0x4d440001UL
-#define MD_ENTRY_VERSION 9
+#define MD_ENTRY_VERSION 13
 enum md_entry_outcome { MD_ENTRY_DECLINED, MD_ENTRY_COMPLETED, MD_ENTRY_UNKNOWN,
-    MD_ENTRY_CHECK_CANCEL, MD_ENTRY_KERNEL_CALL, MD_ENTRY_NATIVE_EFFECT };
+    MD_ENTRY_CHECK_CANCEL, MD_ENTRY_KERNEL_CALL, MD_ENTRY_NATIVE_EFFECT, MD_ENTRY_NEEDS_STOP,
+    /* Resident driver only: original policy and native routing admitted the
+     * call, all adapter ownership is released, and no continuation remains. */
+    MD_ENTRY_NATIVE_CALL,
+    /* Worker-to-execution handoff before any effect. Consumed inside the
+     * runtime, unlike a cancellation or admission decline requiring Base. */
+    MD_ENTRY_DISPATCH };
 struct md_entry_client;
 struct md_entry_call;
 typedef enum md_entry_outcome (*md_entry_step_fn)(struct md_entry_client *,struct md_entry_call *);
@@ -17,6 +23,12 @@ struct md_entry_call {
     int64_t result;
     int32_t number;
     uint32_t reserved;
+    /* Terminal resident response: visit the signal boundary before resuming
+     * the application or entering its native syscall. No effect is replayed. */
+    unsigned return_checkpoint;
+    /* Original architectural PC after SVC, never an internal helper address.
+     * Zero retains kernel admission when an application policy is present. */
+    uintptr_t instruction_pointer;
     /* Optional caller-owned SVC continuation. A libc uses the same site with
      * entry enabled or disabled, preserving instruction-pointer filter policy.
      * It receives only the original syscall, never a synthetic preflight. */
@@ -51,10 +63,13 @@ struct md_entry_api {
     long (*thread_identity)(void);
     /* Resident SVC driver only: its frame defers application handlers until
      * completion. Generic clients keep the original kernel continuation. */
-    int (*native_memory)(struct md_entry_client *,long,long,const uint64_t *,int64_t *);
+    int (*native_memory)(struct md_entry_client *,long,long,const uint64_t *,int64_t *,uintptr_t);
     /* Resident driver has the native identity from thread_identity or the
      * supervisor's sole-mm-owner publication, never a guest namespace PID. */
     enum md_entry_outcome (*try_identified)(struct md_entry_client *,long,struct md_entry_call *);
+    /* Cold resident-driver allocation only. Returns a private per-mm block;
+     * existing client addresses remain stable across directory growth. */
+    uintptr_t (*client_block)(unsigned bucket);
 };
 static inline int md_entry_api_valid(const struct md_entry_api *api) {
     return api && api->version==MD_ENTRY_VERSION && api->size>=sizeof(*api)
@@ -63,29 +78,36 @@ static inline int md_entry_api_valid(const struct md_entry_api *api) {
 static inline int md_entry_offered(const struct md_entry_api *api,long number,unsigned kind) {
     return api && (unsigned long)number<api->syscall_count && (api->offers[number]&kind);
 }
-/* Compiled in libc/the caller, with its unwind metadata. In particular a
- * cancellation or forced unwind never crosses an opaque runtime C frame. */
+/* One caller-owned action, shared by the ordinary API and resident driver.
+ * Inline even in the relocation-free resident payload. Neither transport
+ * duplicates effect execution or the exactly-once continuation handshake. */
+static __attribute__((always_inline)) inline enum md_entry_outcome md_entry_advance(
+        struct md_entry_client *client,struct md_entry_call *call,enum md_entry_outcome action) {
+    md_entry_step_fn next=call->next;
+    switch (action) {
+    case MD_ENTRY_CHECK_CANCEL:
+        if (!call->cancel || !next) return MD_ENTRY_UNKNOWN;
+        call->cancel(); break;
+    case MD_ENTRY_KERNEL_CALL:
+        if (!call->kernel) return MD_ENTRY_UNKNOWN;
+        call->result=call->kernel(call->number,call->args);
+        if (!next) return MD_ENTRY_COMPLETED;
+        break;
+    case MD_ENTRY_NATIVE_EFFECT:
+        if (!call->effect || !next) return MD_ENTRY_UNKNOWN;
+        call->effect(call->effect_context); break;
+    default: return MD_ENTRY_UNKNOWN;
+    }
+    return next(client,call);
+}
+/* Compiled in the caller, with its unwind metadata. In particular cancellation
+ * or forced unwind never crosses an opaque runtime C frame. */
 static inline enum md_entry_outcome md_entry_invoke(const struct md_entry_api *api,
         struct md_entry_client *client,struct md_entry_call *call) {
     enum md_entry_outcome outcome=api->try_syscall(client,call);
-    for (;;) {
-        md_entry_step_fn next=call->next;
-        switch (outcome) {
-        case MD_ENTRY_CHECK_CANCEL:
-            if (!call->cancel || !next) return MD_ENTRY_UNKNOWN;
-            call->cancel(); break;
-        case MD_ENTRY_KERNEL_CALL:
-            if (!call->kernel) return MD_ENTRY_UNKNOWN;
-            call->result=call->kernel(call->number,call->args);
-            if (!next) return MD_ENTRY_COMPLETED;
-            break;
-        case MD_ENTRY_NATIVE_EFFECT:
-            if (!call->effect || !next) return MD_ENTRY_UNKNOWN;
-            call->effect(call->effect_context); break;
-        default: return outcome;
-        }
-        outcome=next(client,call);
-    }
+    while (outcome==MD_ENTRY_CHECK_CANCEL || outcome==MD_ENTRY_KERNEL_CALL || outcome==MD_ENTRY_NATIVE_EFFECT)
+        outcome=md_entry_advance(client,call,outcome);
+    return outcome;
 }
 extern const struct md_entry_api md_cooperative_entry;
 #endif

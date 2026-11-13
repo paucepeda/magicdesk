@@ -3,6 +3,7 @@
 #include <sys/mman.h>
 #include "fs_buffer.h"
 #include "posix_acl.h"
+#include "linux_abi.h"
 #include <assert.h>
 #include <asm/hwcap.h>
 #include <errno.h>
@@ -190,6 +191,11 @@ static void restricted_descriptors(int via_prctl) {
         int proc=open("/proc/self/uid_map",O_RDONLY); assert(proc>=0);
         struct sock_filter rules[]={
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,nr)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_ioctl,0,4),
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,args[1])),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,FIOCLEX,0,1),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|EACCES),
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,nr)),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_prctl,0,1),
             BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|EPERM),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_seccomp,0,1),
@@ -235,6 +241,11 @@ static void restricted_descriptors(int via_prctl) {
         assert(fcntl(target,F_GETFD)==0);
         int wide=syscall(SYS_fcntl,copy,high|F_DUPFD_CLOEXEC,101); assert(wide>=101);
         assert(fcntl(wide,F_GETFD)==FD_CLOEXEC);
+        assert(!syscall(SYS_ioctl,wide,high|FIONCLEX,~0UL));
+        assert(fcntl(wide,F_GETFD)==0);
+        assert(syscall(SYS_ioctl,wide,high|FIOCLEX,~0UL)==-1 && errno==EACCES);
+        assert(fcntl(wide,F_GETFD)==0);
+        assert(!fcntl(wide,F_SETFD,FD_CLOEXEC));
         assert(!syscall(SYS_close_range,(unsigned)target,(unsigned)target,
             CLOSE_RANGE_UNSHARE|CLOSE_RANGE_CLOEXEC));
         assert(fcntl(target,F_GETFD)==FD_CLOEXEC);
@@ -515,13 +526,16 @@ static int custody_child(void *argument) {
     if (c->call==SYS_openat) program=(struct sock_fprog){sizeof(delivery)/sizeof(*delivery),delivery};
     assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
     assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
-    /* The fifth openat argument is ignored by the kernel; the internal anchor
-     * gate uses it to select a retained result. Kill only that delivery, not the
-     * original application open. Native controls never enter this gate. */
+    /* The original open is allowed even when an internal transport would
+     * match the filter. A subsequent guest call must still be denied. */
     int fd=syscall(SYS_openat,c->dirfd,"custody-file",c->flags,0,0,0); assert(fd>=0);
-    assert(!close(fd)); return 0;
+    assert(!close(fd));
+    if (c->call==SYS_openat)
+        syscall(SYS_openat,c->dirfd,"custody-file",c->flags,0,MD_FS_BUFFER_SOURCE,0);
+    else syscall(c->call,-1,NULL,0);
+    assert(!"denied application operation returned"); return 99;
 }
-static unsigned terminal_custody(int guest, int protected, int call, int explicit_base, int nofollow) {
+static unsigned terminal_custody(int protected, int call, int explicit_base, int nofollow) {
     int fd=open("custody-file",O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC,0600);
     assert(fd>=0 && fd<256 && !close(fd));
     int base=explicit_base ? open(".",O_PATH|O_DIRECTORY|O_CLOEXEC) : AT_FDCWD;
@@ -536,9 +550,7 @@ static unsigned terminal_custody(int guest, int protected, int call, int explici
     /* EVENT_WAIT: exact child termination precedes inspection of its surviving
      * shared FD table. The fixture alarm is a failure bound, not a settling delay. */
     assert(waitpid(child,&status,0)==child);
-    if (guest && call==SYS_openat)
-        assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
-    else assert(WIFEXITED(status) && !WEXITSTATUS(status));
+    assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
     unsigned leaked=0;
     for (unsigned i=0;i<sizeof(before);++i) {
         int flags=fcntl((int)i,F_GETFD);
@@ -761,7 +773,7 @@ static void native_cwd(int inherited) {
     }
     printf("PASS native cwd: inherited=%d, protected caller, zero free FD slots and unchanged file table\n",inherited);
 }
-struct capture_context { int guest, protected, stage, directory; };
+struct capture_context { int protected, stage, directory; };
 static int capture_terminal_child(void *context) {
     struct capture_context *c=context;
     if (c->protected) assert(!prctl(PR_SET_DUMPABLE,0));
@@ -779,19 +791,17 @@ static int capture_terminal_child(void *context) {
     assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
     char text[128];
     ssize_t result=readlink("/proc/thread-self/cwd",text,sizeof(text));
-    int error=errno;
-    if (c->guest && (c->stage!=3 || c->protected)
-            && !(result==-1 && error==(c->stage<2 ? EACCES : ECANCELED)))
-        fprintf(stderr,"capture terminal protected=%d stage=%d result=%zd errno=%d\n",
-            c->protected,c->stage,result,error);
-    /* Dumpable O_PATH capture no longer calls sendmsg. Protected callers
-     * still exercise the exact export-thread death and terminal cleanup. */
-    if (c->guest && (c->stage!=3 || c->protected))
-        assert(result==-1 && error==(c->stage<2 ? EACCES : ECANCELED));
-    else assert(result==4 && !memcmp(text,"/dev",4));
+    assert(result==4 && !memcmp(text,"/dev",4));
+    /* Unrelated guest denials must not constrain private implementation calls.
+     * Exercise the original denial after checking the allowed operation. */
+    long denied=c->stage==0 ? syscall(SYS_clone,CLONE_THREAD,0,0,0,0)
+        : c->stage==1 ? syscall(SYS_close_range,UINT_MAX,0,0)
+        : c->stage==2 ? syscall(SYS_openat,AT_FDCWD,NULL,O_RDONLY,0)
+        : syscall(SYS_sendmsg,-1,NULL,0);
+    assert(c->stage<2 && denied==-1 && errno==EACCES);
     return 0;
 }
-static void capture_terminal(int guest,int inherited) {
+static void capture_terminal(int inherited) {
     int directory=inherited ? fcntl(STDIN_FILENO,F_DUPFD_CLOEXEC,0)
         : open("/dev",O_PATH|O_DIRECTORY|O_CLOEXEC);
     assert(directory>=0);
@@ -803,15 +813,20 @@ static void capture_terminal(int guest,int inherited) {
     void *stack=malloc(1024*1024); assert(stack);
     for (int protected=0;protected<2;++protected) for (int stage=0;stage<4;++stage)
         for (unsigned repeat=0;repeat<4;++repeat) {
-            struct capture_context context={guest && inherited,protected,stage,directory};
+            struct capture_context context={protected,stage,directory};
             pid_t child=clone(capture_terminal_child,(char *)stack+1024*1024,SIGCHLD|CLONE_FILES,&context);
-            assert(child>0); reap(child);
+            assert(child>0);
+            int status;
+            /* EVENT_WAIT: exact filtered child; the fixture alarm bounds failure. */
+            assert(waitpid(child,&status,0)==child);
+            if (stage<2) assert(WIFEXITED(status) && !WEXITSTATUS(status));
+            else assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
             for (int i=0;i<64;++i) assert(fcntl(i,F_GETFD)>=0);
         }
     free(stack);
     for (int i=0;i<count;++i) assert(!close(held[i]));
     assert(!setrlimit(RLIMIT_NOFILE,&saved) && !close(directory));
-    puts("PASS capture terminal ownership: clone/clear/open failure, proc custody without sendmsg, protected export death and full-table survivors");
+    puts("PASS capture terminal ownership: allowed readlink, guest ERRNO/KILL filters and full-table survivors");
 }
 struct proc_context { int first, second; struct stat expected; char cwd[PATH_MAX]; };
 static void *proc_thread(void *argument) {
@@ -1047,6 +1062,14 @@ static unsigned export_fds(unsigned char *snapshot) {
     }
     return count;
 }
+static int capture_source(int fd) {
+    /* The host-only profile denies this slot; guest filters and dumpability
+     * remain independent, and bootstrap listener capture stays available. */
+    assert(fd>=0 && !getenv("MAGICDESK_TEST_CAPTURE_FALLBACK"));
+    if (fd!=STDIN_FILENO)
+        assert(dup3(fd,STDIN_FILENO,O_CLOEXEC)==STDIN_FILENO && !close(fd));
+    return STDIN_FILENO;
+}
 struct export_context { int directory, channel, mode; };
 static int export_child(void *argument) {
     struct export_context *c=argument;
@@ -1060,6 +1083,10 @@ static int export_child(void *argument) {
         struct sock_fprog program={sizeof(code)/sizeof(*code),code};
         assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
         assert(lseek(c->directory,3,SEEK_SET)==3);
+        /* Deny an application operation, not an implementation-detail FD
+         * export used to complete the allowed lseek. */
+        syscall(SYS_sendmsg,-1,NULL,0);
+        assert(!"denied application sendmsg returned");
     } else if (c->mode==3) {
         char number[24]; snprintf(number,sizeof(number),"%d",c->channel);
         execl(executable,executable,"export-exec",number,(char *)NULL); return 99;
@@ -1072,6 +1099,7 @@ static int export_child(void *argument) {
 }
 static void buffer_export(int guest) {
     int directory=open(".",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if (guest) directory=capture_source(directory);
     int alias=directory<0 ? -1 : dup(directory);
     int separate=open(".",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
     assert(directory>=0 && alias>=0 && separate>=0);
@@ -1118,8 +1146,7 @@ static void buffer_export(int guest) {
         pid_t child=clone(export_child,(char *)stack+1024*1024,CLONE_FILES|SIGCHLD,&c); assert(child>0);
         /* EVENT_WAIT: exact child exit; the fixture alarm bounds a stuck export. */
         int status; assert(waitpid(child,&status,0)==child);
-        if (guest) assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
-        else assert(WIFEXITED(status) && !WEXITSTATUS(status));
+        assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
         assert(lseek(directory,2,SEEK_SET)==2 && export_fds(NULL)==baseline+(unsigned)guest);
     }
     if (guest) {
@@ -1162,7 +1189,9 @@ static int metadata_export_child(void *argument) {
     };
     struct sock_fprog program={sizeof(code)/sizeof(*code),code};
     assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
-    struct stat st; assert(!fstat(file,&st)); return 0;
+    struct stat st; assert(!fstat(file,&st));
+    syscall(SYS_sendmsg,-1,NULL,0);
+    assert(!"denied application sendmsg returned"); return 99;
 }
 static void retained_proc_filter(int proc) {
     pid_t child=fork(); assert(child>=0);
@@ -1193,8 +1222,11 @@ static void retained_proc_filter(int proc) {
 static void metadata_export(int guest, int managed) {
     unsigned extra=guest && !managed;
     int file=open("metadata-export",O_RDWR|O_CREAT|O_CLOEXEC,0600);
+    if (file<0) perror("metadata export file");
     int proc=open("/proc",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if (proc<0) perror("metadata export proc");
     assert(file>=0 && proc>=0);
+    if (extra) file=capture_source(file);
     put(file);
     struct rlimit saved,limit;
     assert(!getrlimit(RLIMIT_NOFILE,&saved)); limit=saved; limit.rlim_cur=64;
@@ -1261,8 +1293,7 @@ static void metadata_export(int guest, int managed) {
         assert(pid>0);
         /* EVENT_WAIT: exporter terminal event; alarm bounds a missing exit. */
         int status; assert(waitpid(pid,&status,0)==pid);
-        if (guest && !managed) assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
-        else assert(WIFEXITED(status) && !WEXITSTATUS(status));
+        assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
         assert(export_fds(NULL)==baseline+extra);
         assert(!fstat(file,&st) && st.st_size==1);
     }
@@ -1285,7 +1316,10 @@ static int return_child(void *unused) {
     struct sock_fprog program={sizeof(code)/sizeof(*code),code};
     assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
     int fd=open(return_paths[0],O_PATH|O_NOFOLLOW|O_CLOEXEC);
-    assert(fd>=0 && !close(fd)); return 0;
+    assert(fd>=0 && !close(fd));
+    /* The guest filter owns guest recvmsg, not an allowed open's transport. */
+    syscall(SYS_recvmsg,-1,NULL,0);
+    assert(!"denied application recvmsg returned"); return 99;
 }
 static void buffer_return(int guest) {
     return_paths[0]=guest ? "/attached/null" : "/dev/null";
@@ -1362,11 +1396,10 @@ static void buffer_return(int guest) {
     for (int i=0;i<16;++i) {
         pid_t child=clone(return_child,(char *)stack+1024*1024,CLONE_FILES|SIGCHLD,NULL);
         assert(child>0);
-        /* EVENT_WAIT: receiver death while a result is queued; alarm bounds a
-         * stuck table/channel turn. The surviving peer must receive next. */
+        /* EVENT_WAIT: filtered receiver death; alarm bounds a stuck table or
+         * channel turn. The surviving peer must receive the next descriptor. */
         int status; assert(waitpid(child,&status,0)==child);
-        if (guest) assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
-        else assert(WIFEXITED(status) && !WEXITSTATUS(status));
+        assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
         fd=open(return_paths[1],O_PATH|O_NOFOLLOW|O_CLOEXEC);
         assert(fd>=0 && !close(fd) && export_fds(NULL)==baseline);
     }
@@ -1396,7 +1429,10 @@ static void buffer_descriptors(void) {
                 };
                 struct sock_fprog program={sizeof(filter)/sizeof(*filter),filter};
                 assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
-                assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
+                long installed=syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program);
+                if (installed) fprintf(stderr,"buffer filter protected=%d slots=%d cloexec=%d result=%ld errno=%d\n",
+                    protected,slots,cloexec,installed,errno);
+                assert(!installed);
                 for (unsigned i=0;i<24;++i) {
                     const char *path=i%3==2 ? "/proc/self/exe" : i%3 ? "/proc/self/mounts" : "/proc/self/mountinfo";
                     fd=open(path,
@@ -1753,6 +1789,93 @@ static void watch_slots(void) {
     }
     assert(!close(file) && !unlink("watch-link") && !unlink("watch-slots"));
     puts("PASS watch paths without private FDs: protected callers, admitted transport, full table and symlink selection");
+}
+static void xattr_at(void) {
+    const char *name="user.magicdesk.at", *text="metadata";
+    int fd=open("xattr-at",O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC,0600); assert(fd>=0);
+    int dir=open(".",O_PATH|O_DIRECTORY|O_CLOEXEC); assert(dir>=0);
+    int pathfd=open("xattr-at",O_PATH|O_CLOEXEC); assert(pathfd>=0);
+    assert(!symlink("xattr-at","xattr-at-link"));
+    char absolute[PATH_MAX], output[256];
+    assert(getcwd(absolute,sizeof(absolute)));
+    assert(strlen(absolute)+strlen("/xattr-at")<sizeof(absolute));
+    strcat(absolute,"/xattr-at");
+    struct md_xattr_args value={.value=(uintptr_t)text,.size=8,.flags=XATTR_CREATE};
+    assert(!syscall(SYS_setxattrat,dir,"xattr-at",0,name,&value,sizeof(value)));
+    assert(syscall(SYS_setxattrat,dir,"xattr-at",0,name,&value,sizeof(value))==-1 && errno==EEXIST);
+    struct md_xattr_args get={.value=(uintptr_t)output,.size=sizeof(output)};
+    const struct { int fd; const char *path; unsigned flags; } targets[]={
+        {dir,"xattr-at",0}, {dir,"xattr-at-link",0}, {-1,absolute,0},
+        {fd,"",AT_EMPTY_PATH}, {fd,NULL,AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW}
+    };
+    for (unsigned i=0;i<sizeof(targets)/sizeof(*targets);++i) {
+        int base=targets[i].fd; const char *path=targets[i].path; unsigned flags=targets[i].flags;
+        value.flags=XATTR_REPLACE;
+        assert(!syscall(SYS_setxattrat,base,path,flags,name,&value,sizeof(value)));
+        assert(fgetxattr(fd,name,output,sizeof(output))==8 && !memcmp(output,text,8));
+        memset(output,0,sizeof(output));
+        assert(syscall(SYS_getxattrat,base,path,flags,name,&get,sizeof(get))==8 && !memcmp(output,text,8));
+        long size=syscall(SYS_listxattrat,base,path,flags,NULL,0); assert(size>0 && (size_t)size<sizeof(output));
+        assert(syscall(SYS_listxattrat,base,path,flags,output,sizeof(output))==size);
+        int found=0;
+        for (long at=0;at<size;at+=strlen(output+at)+1) found|=!strcmp(output+at,name);
+        assert(found);
+        assert(!syscall(SYS_removexattrat,base,path,flags,name));
+        assert(fgetxattr(fd,name,output,sizeof(output))==-1 && errno==ENODATA);
+        value.flags=XATTR_CREATE;
+        assert(!syscall(SYS_setxattrat,base,path,flags,name,&value,sizeof(value)));
+    }
+    assert(syscall(SYS_getxattrat,dir,"xattr-at-link",AT_SYMLINK_NOFOLLOW,name,&get,sizeof(get))==-1 && errno==ENODATA);
+    assert(syscall(SYS_getxattrat,dir,"missing",0,name,&get,sizeof(get))==-1 && errno==ENOENT);
+    assert(syscall(SYS_getxattrat,-1,"xattr-at",0,name,&get,sizeof(get))==-1 && errno==EBADF);
+    assert(syscall(SYS_getxattrat,fd,"xattr-at",0,name,&get,sizeof(get))==-1 && errno==ENOTDIR);
+    assert(syscall(SYS_getxattrat,pathfd,"",AT_EMPTY_PATH,name,&get,sizeof(get))==-1 && errno==EBADF);
+    assert(syscall(SYS_getxattrat,AT_FDCWD,NULL,AT_EMPTY_PATH,name,&get,sizeof(get))==-1 && errno==EBADF);
+    assert(syscall(SYS_getxattrat,fd,"",0,name,&get,sizeof(get))==-1 && errno==ENOENT);
+    assert(syscall(SYS_getxattrat,fd,NULL,0,name,&get,sizeof(get))==-1 && errno==EFAULT);
+    assert(syscall(SYS_getxattrat,dir,"xattr-at",AT_SYMLINK_FOLLOW,name,&get,sizeof(get))==-1 && errno==EINVAL);
+    assert(syscall(SYS_getxattrat,dir,"xattr-at",0,name,&get,sizeof(get)-1)==-1 && errno==EINVAL);
+    assert(syscall(SYS_getxattrat,dir,"xattr-at",0,name,&get,sysconf(_SC_PAGESIZE)+1)==-1 && errno==E2BIG);
+    assert(syscall(SYS_getxattrat,dir,"xattr-at",0,name,(void *)1,sizeof(get))==-1 && errno==EFAULT);
+    struct { struct md_xattr_args args; uint64_t tail; } extended={.args=get};
+    assert(syscall(SYS_getxattrat,dir,"xattr-at",0,name,&extended,sizeof(extended))==8);
+    extended.tail=1;
+    assert(syscall(SYS_getxattrat,dir,"xattr-at",0,name,&extended,sizeof(extended))==-1 && errno==E2BIG);
+    get.flags=1;
+    assert(syscall(SYS_getxattrat,dir,"xattr-at",0,name,&get,sizeof(get))==-1 && errno==EINVAL);
+    get.flags=0; get.size=1;
+    assert(syscall(SYS_getxattrat,dir,"xattr-at",0,name,&get,sizeof(get))==-1 && errno==ERANGE);
+    get.size=8; get.value=1;
+    assert(syscall(SYS_getxattrat,dir,"xattr-at",0,name,&get,sizeof(get))==-1 && errno==EFAULT);
+    value.flags=4;
+    assert(syscall(SYS_setxattrat,dir,"xattr-at",0,name,&value,sizeof(value))==-1 && errno==EINVAL);
+    value.flags=0; value.value=1;
+    assert(syscall(SYS_setxattrat,dir,"xattr-at",0,name,&value,sizeof(value))==-1 && errno==EFAULT);
+    assert(syscall(SYS_listxattrat,dir,"xattr-at",0,(void *)1,sizeof(output))==-1 && errno==EFAULT);
+    pid_t child=fork(); assert(child>=0);
+    if (!child) {
+        struct sock_filter filter[]={
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,nr)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_setxattrat,3,0),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_getxattrat,2,0),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_listxattrat,1,0),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_removexattrat,0,1),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|EUCLEAN),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)
+        };
+        struct sock_fprog program={.len=sizeof(filter)/sizeof(*filter),.filter=filter};
+        assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
+        assert(!prctl(PR_SET_SECCOMP,SECCOMP_MODE_FILTER,&program));
+        const long calls[]={SYS_setxattrat,SYS_getxattrat,SYS_listxattrat,SYS_removexattrat};
+        for (unsigned i=0;i<4;++i)
+            assert(syscall(calls[i],dir,"xattr-at",0,name,&value,sizeof(value))==-1 && errno==EUCLEAN);
+        assert(fgetxattr(fd,name,output,sizeof(output))==8);
+        _exit(0);
+    }
+    reap(child);
+    assert(!close(pathfd) && !close(dir) && !close(fd));
+    assert(!unlink("xattr-at-link") && !unlink("xattr-at"));
+    puts("PASS xattr-at: dirfd, legacy metadata, empty descriptor, nofollow, versioned arguments, faults and guest seccomp");
 }
 static volatile sig_atomic_t size_signals;
 static void xattr_slots(int guest) {
@@ -2241,7 +2364,9 @@ int test_parallel_read_guest(const char *);
 int test_read_capture_guest(const char *);
 int test_kernel_profile_guest(void);
 int test_kernel_profile_child(void);
+#include "native_probe.h"
 int main(int argc, char **argv) {
+    md_test_native_probe(argc,argv);
     if (argc==2 && !strcmp(argv[1],"kernel-profile")) return test_kernel_profile_guest();
     if (argc==2 && !strcmp(argv[1],"kernel-profile-child")) return test_kernel_profile_child();
     if (argc==2 && (!strcmp(argv[1],"processor-state") || !strcmp(argv[1],"processor-state-exec"))) {
@@ -2326,6 +2451,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1],"metadata-slots-native")) { metadata_slots(0); return 0; }
     if (!strcmp(argv[1],"xattr-slots")) { xattr_slots(1); return 0; }
     if (!strcmp(argv[1],"xattr-slots-native")) { xattr_slots(0); return 0; }
+    if (!strcmp(argv[1],"xattr-at")) { xattr_at(); return 0; }
     if (!strcmp(argv[1],"watch-slots")) { watch_slots(); return 0; }
     if (!strcmp(argv[1],"proc-reopen-slots")) { proc_reopen_slots(); return 0; }
     if (!strcmp(argv[1],"buffer-cwd")) { buffer_cwd(); return 0; }
@@ -2336,8 +2462,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1],"proc-thread-capture")) { proc_thread_capture(); return 0; }
     if (!strcmp(argv[1],"capture-terminal") || !strcmp(argv[1],"capture-terminal-native")
             || !strcmp(argv[1],"capture-terminal-inherited") || !strcmp(argv[1],"capture-terminal-inherited-native")) {
-        int native=strstr(argv[1],"-native")!=NULL;
-        capture_terminal(!native,strstr(argv[1],"-inherited")!=NULL); return 0;
+        capture_terminal(strstr(argv[1],"-inherited")!=NULL); return 0;
     }
     if (!strcmp(argv[1],"buffer-open")) { buffer_open(); return 0; }
     if (!strcmp(argv[1],"path-invocation")) { path_invocation(); return 0; }
@@ -2389,14 +2514,13 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1],"custody") || !strcmp(argv[1],"custody-native")
             || !strcmp(argv[1],"custody-dirfd") || !strcmp(argv[1],"custody-nofollow")
             || !strcmp(argv[1],"custody-native-dirfd") || !strcmp(argv[1],"custody-native-nofollow")) {
-        int guest=strncmp(argv[1],"custody-native",14)!=0;
         int explicit_base=!strcmp(argv[1],"custody-dirfd") || !strcmp(argv[1],"custody-native-dirfd");
         int nofollow=!strcmp(argv[1],"custody-nofollow") || !strcmp(argv[1],"custody-native-nofollow");
         unsigned leaked=0;
         for (int protected=0;protected<2;++protected) {
-            leaked+=terminal_custody(guest,protected,SYS_connect,explicit_base,nofollow);
-            leaked+=terminal_custody(guest,protected,SYS_recvmsg,explicit_base,nofollow);
-            leaked+=terminal_custody(guest,protected,SYS_openat,explicit_base,nofollow);
+            leaked+=terminal_custody(protected,SYS_connect,explicit_base,nofollow);
+            leaked+=terminal_custody(protected,SYS_recvmsg,explicit_base,nofollow);
+            leaked+=terminal_custody(protected,SYS_openat,explicit_base,nofollow);
         }
         return leaked ? 1 : 0;
     }

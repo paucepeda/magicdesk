@@ -13,8 +13,10 @@ import json
 import os
 from pathlib import Path
 import queue
+import selectors
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -48,10 +50,18 @@ def wait_daemon_api(endpoint, report, timeout=45):
         threading.Event().wait(min(0.1, max(0, deadline - time.monotonic())))
 
 
+def ensure_image(client, image, archive=''):
+    if client('image', 'inspect', image):
+        return True
+    operation = ('load', '--input', archive) if archive else ('pull', image)
+    return client(*operation) and client('image', 'inspect', image)
+
+
 def guest(profile, image, trace=False, cgroup='none', cgroupns='private', trace_runtime=False,
           no_new_keyring=False, trace_filesystem=False, create_count=0, trace_network=False, observer='',
           storage_driver='vfs', data_root='', userland_proxy=True, internet=False, endpoint='', ipv6=False,
-          internet_ipv6=False, ipv6_host='::1', rootless_user=''):
+          internet_ipv6=False, ipv6_host='::1', rootless_user='', image_archive='', network_repeats=20):
+    assert network_repeats > 0
     if rootless_user and os.getuid() == 0:
         import pwd
         assert pwd.getpwnam(rootless_user).pw_uid != 0, 'Select an ordinary guest user'
@@ -139,9 +149,10 @@ def guest(profile, image, trace=False, cgroup='none', cgroupns='private', trace_
                            + 'os.execv(command[0], command)\n')
         wrapper.chmod(0o700)
         argv += ['--add-runtime=mdtrace=' + str(wrapper), '--default-runtime=mdtrace']
-    if trace_network:
+    network_calls = 'trace=%network,ioctl,setns,unshare,capget,capset'
+    if trace_network and not rootless_user:
         argv = ['strace', '-D', '-f', '-s', '512', '-e',
-                'trace=%network,ioctl', '-o', str(base / 'network.log'), *argv]
+                network_calls, '-yy', '-o', str(base / 'network.log'), *argv]
     elif trace_filesystem:
         argv = ['strace', '-D', '-f', '-s', '256', '-e',
                 'trace=%file,getdents64,lseek', '-o', str(base / 'filesystem.log'), *argv]
@@ -178,6 +189,7 @@ def guest(profile, image, trace=False, cgroup='none', cgroupns='private', trace_
             records.put('eof')
 
     reader = None
+    tracer = None
     if process:
         reader = threading.Thread(target=drain)
         reader.start()
@@ -226,18 +238,21 @@ def guest(profile, image, trace=False, cgroup='none', cgroupns='private', trace_
                               'type=bind,src=' + str(Path(__file__).with_name('docker_network_fixture.py'))
                               + ',dst=/fixture.py,readonly', image, 'python3', '/fixture.py', name, *family)
                 wait_service(['docker', '--host', endpoint, 'logs', '-f', name])
-                report.setdefault('portChecks', []).append(external(operation='exchange', port=port, token=name, repeats=20))
+                report.setdefault('portChecks', []).append(external(operation='exchange', port=port, token=name, repeats=network_repeats))
             for source, target in (names, tuple(reversed(names))):
                 field = 'GlobalIPv6Address' if ipv6 else 'IPAddress'
                 assert client('inspect', '--format', '{{range .NetworkSettings.Networks}}{{.' + field + '}}{{end}}', target)
                 address = str(ipaddress.ip_address(report['commands'][-1]['output'].strip()))
-                assert client('exec', source, 'python3', '/fixture.py', '--client', address, '8080', target, '20', *family)
-                assert client('exec', source, 'python3', '/fixture.py', '--client', target, '8080', target, '20', *family)
+                assert client('exec', source, 'python3', '/fixture.py', '--client', address, '8080', target, str(network_repeats), *family)
+                assert client('exec', source, 'python3', '/fixture.py', '--client', target, '8080', target, str(network_repeats), *family)
             report['containerPeerExchangePassed'] = True
             report['namedPeerExchangePassed'] = True
             outbound = observe(observer, operation='outbound')['url']
             for name in names:
-                assert client('exec', name, 'python3', '/fixture.py', '--http', outbound)
+                assert client('exec', name, 'python3', '/fixture.py', '--files')
+                assert 'CONTAINER_FILES_OK' in report['commands'][-1]['output'], report['commands'][-1]
+                assert client('exec', name, 'python3', '/fixture.py', '--http', outbound, str(network_repeats))
+            report['fileOperationsPassed'] = True
             report['localOutboundPassed'] = True
             assert not client('run', '--rm', '--name', conflict, '--network', network,
                               '-p', f'{host}:{ports[0]}:8080', image, '/bin/true')
@@ -260,6 +275,13 @@ def guest(profile, image, trace=False, cgroup='none', cgroupns='private', trace_
                                                 capture_output=True, text=True, timeout=15)
                     report['containerDiagnostics'].append(dict(name=name, operation=operation,
                         exitCode=diagnostic.returncode, output=(diagnostic.stdout + diagnostic.stderr)[-12000:]))
+                diagnostic = subprocess.run(['docker', '--host', endpoint, 'exec', name, 'python3', '-c',
+                    'from pathlib import Path; '
+                    '[(print(p), print(Path(p).read_text())) for p in '
+                    '("/proc/net/tcp", "/proc/net/tcp6", "/proc/net/route", "/etc/resolv.conf")]'],
+                    capture_output=True, text=True, timeout=15)
+                report['containerDiagnostics'].append(dict(name=name, operation='network-state',
+                    exitCode=diagnostic.returncode, output=(diagnostic.stdout + diagnostic.stderr)[-12000:]))
             raise
         finally:
             removed = client('rm', '-f', *names, conflict)
@@ -279,7 +301,24 @@ def guest(profile, image, trace=False, cgroup='none', cgroupns='private', trace_
                 info = json.loads(report['commands'][-1]['output'])
                 assert 'name=rootless' in info['SecurityOptions'], info['SecurityOptions']
                 assert any('seccomp' in option for option in info['SecurityOptions']), info['SecurityOptions']
-            if report['apiReady'] and (client('image', 'inspect', image) or client('pull', image)):
+            if report['apiReady'] and ensure_image(client, image, image_archive):
+                if trace_network and rootless_user:
+                    # Retain set-ID startup and uninstrumented image preparation.
+                    pid = int((base / 'docker.pid').read_text())
+                    tracer = subprocess.Popen(['strace', '-f', '-tt', '-s', '512', '-yy', '-e',
+                        network_calls, '-o', str(base / 'network.log'), '-p', str(pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(tracer.stderr, selectors.EVENT_READ)
+                        messages = b''
+                        deadline = time.monotonic() + 10
+                        # EVENT_WAIT: attachment acknowledgement; expiry fails diagnosis.
+                        while b'attached' not in messages:
+                            assert selector.select(max(0, deadline - time.monotonic())), messages
+                            data = tracer.stderr.read1(4096)
+                            assert data, messages
+                            messages += data
+                    report['daemonTraceAttachment'] = messages.decode(errors='replace')
                 for number in range(create_count):
                     name = 'md-copy-' + str(number)
                     if not client('create', '--name', name, '--network', 'none', '--cgroupns',
@@ -305,6 +344,18 @@ def guest(profile, image, trace=False, cgroup='none', cgroupns='private', trace_
     except Exception:
         report['failure'] = traceback.format_exc()
     finally:
+        if tracer:
+            if tracer.poll() is None:
+                tracer.send_signal(signal.SIGINT)
+            # EVENT_WAIT: detach before the ordinary daemon shutdown workflow.
+            try:
+                _, messages = tracer.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                tracer.kill()
+                _, messages = tracer.communicate(timeout=10)
+                report['daemonTraceForcedStop'] = True
+            report['daemonTraceDetach'] = messages.decode(errors='replace')
+            report['daemonTraceExitCode'] = tracer.returncode
         if process:
             if process.poll() is None:
                 process.terminate()
@@ -350,7 +401,7 @@ def guest(profile, image, trace=False, cgroup='none', cgroupns='private', trace_
                         following = 80
             report['filesystemTrace'] = {'lines': count, 'tail': list(tail), 'conflicts': list(conflicts),
                                          'cleanupFailures': list(cleanup)}
-        if trace_network:
+        if trace_network and (base / 'network.log').exists():
             with (base / 'network.log').open(errors='replace') as stream:
                 report['networkTrace'] = list(collections.deque((line for line in stream
                     if not any(marker in line for marker in ('--- SIGURG ', '--- SIGCHLD ', '+++ exited with'))), maxlen=180))
@@ -361,6 +412,7 @@ def guest(profile, image, trace=False, cgroup='none', cgroupns='private', trace_
 
 def main():
     from test_oci_services import Suite, add_machine_entry_argument
+    from fixture_executor import FixtureExecutor
     from kernel_profile import KernelProfile
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('build', type=Path)
@@ -391,6 +443,7 @@ def main():
     parser.add_argument('--exercise-ports', action='store_true',
                         help='Verify TCP/UDP publication from outside Shroot; use a Python image')
     add_machine_entry_argument(parser)
+    FixtureExecutor.add_argument(parser)
     KernelProfile.add_argument(parser)
     args = parser.parse_args()
     args.profile = args.profile or ('rootless' if args.rootless_user else 'rootless-no-network')
@@ -403,18 +456,18 @@ def main():
     if args.image is None:
         args.image = 'python:3.14-alpine' if args.exercise_ports else 'busybox:1.37.0'
     suite = Suite(args.build, args.build, machine_entry=args.machine_entry,
-                  kernel_profile=args.kernel_profile)
+                  kernel_profile=args.kernel_profile, executor=args.executor)
     suite.report.update(store=args.store, probe=True, profile=args.profile, cgroup=args.cgroup)
     target = '/tmp/md-docker-probe-' + suite.report['id']
     prefix = suite.guest(args.store, '--user', '0:0')
     observer = None
     created = False
     try:
-        suite.transport.upload(suite.client, Path(__file__), suite.base + '/probe.py')
+        suite.upload(Path(__file__), suite.base + '/probe.py')
         if args.exercise_ports:
             from docker_network_fixture import Observer
             observer = Observer(args.ipv6_host)
-            suite.transport.upload(suite.client, Path(__file__).with_name('docker_network_fixture.py'),
+            suite.upload(Path(__file__).with_name('docker_network_fixture.py'),
                                    suite.base + '/docker_network_fixture.py')
         suite.command(prefix + ['--', '/bin/mkdir', target])
         created = True
@@ -450,6 +503,9 @@ def main():
         if observer:
             assert suite.report['probeResult'].get('portPublicationPassed'), 'Port matrix failed; see ' + str(suite.output)
             assert suite.report['probeResult'].get('containerPeerExchangePassed'), suite.report['probeResult']
+            if args.machine_entry:
+                assert any(row.get('filteredCompleted', 0) for row in suite.report['machineEntry']['processes']), \
+                    'No post-filter lazy completions in container workload'
             assert suite.report['probeResult']['daemonExitCode'] == 0, suite.report['probeResult']
             assert suite.report['probeResult']['readerDrained'], suite.report['probeResult']
             if args.internet:

@@ -14,6 +14,8 @@
 #include <linux/seccomp.h>
 #include <linux/stat.h>
 #include <linux/openat2.h>
+#include <linux/if_tun.h>
+#include <net/if.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -46,13 +48,22 @@ static const struct md_entry_api *api;
 static struct md_entry_client client;
 static const char *path="/tmp/cooperative-file";
 static unsigned direct_calls, fallback_calls;
+extern char entry_test_kernel_return[];
+static long caller_kernel(long number,const uint64_t *args);
+static struct md_entry_call caller_request(int number,const uint64_t args[6]) {
+    struct md_entry_call call={.number=number,.kernel=caller_kernel,
+        .instruction_pointer=(uintptr_t)entry_test_kernel_return};
+    memcpy(call.args,args,sizeof(call.args));
+    return call;
+}
 static enum md_entry_outcome stat_try(struct md_entry_client *c,struct stat *st,long *result) {
-    struct md_entry_call call={.number=SYS_newfstatat,.args={AT_FDCWD,(uintptr_t)path,(uintptr_t)st,0}};
+    struct md_entry_call call=caller_request(SYS_newfstatat,
+        (uint64_t[6]){AT_FDCWD,(uintptr_t)path,(uintptr_t)st});
     enum md_entry_outcome outcome=md_entry_invoke(api,c,&call);
     *result=call.result; return outcome;
 }
 static long call6(int nr,unsigned long a,unsigned long b,unsigned long c,unsigned long d,unsigned long e,unsigned long f) {
-    struct md_entry_call call={.number=nr,.args={a,b,c,d,e,f}};
+    struct md_entry_call call=caller_request(nr,(uint64_t[6]){a,b,c,d,e,f});
     enum md_entry_outcome outcome=md_entry_invoke(api,&client,&call);
     assert(outcome!=MD_ENTRY_UNKNOWN);
     if (outcome==MD_ENTRY_COMPLETED) { ++direct_calls; return call.result; }
@@ -123,9 +134,103 @@ static void site_discovery(void) {
     assert(!unlink(path));
     puts("PASS native site discovery: 32 distinct SVCs without explicit entry API");
 }
-static void proc_discovery(void) {
+static int provider_wait_fd,provider_jump;
+static volatile sig_atomic_t provider_signal;
+static sigjmp_buf provider_boundary;
+static void provider_interrupted(int signal) {
+    assert(signal==SIGUSR1); ++provider_signal;
+    assert(!fcntl(provider_wait_fd,F_SETFL,O_NONBLOCK));
+    if (provider_jump) siglongjmp(provider_boundary,1);
+}
+static void interrupted_wait_contract(int fd,long nr,uintptr_t buffer,size_t size) {
+    provider_wait_fd=fd;
+    struct sigaction previous,action={.sa_handler=provider_interrupted};
+    sigemptyset(&action.sa_mask); assert(!sigaction(SIGUSR1,&action,&previous));
+    struct sigevent event={.sigev_notify=SIGEV_SIGNAL,.sigev_signo=SIGUSR1};
+    timer_t timer; assert(!timer_create(CLOCK_MONOTONIC,&event,&timer));
+    md_test_syscall_fn call=md_test_syscall_site(1);
+    for (unsigned mode=0;mode<3;++mode) {
+        assert(call(fd,buffer,size,0,0,0,nr)==-EAGAIN);
+        assert(!fcntl(provider_wait_fd,F_SETFL,0));
+        action.sa_flags=mode ? SA_RESTART : 0;
+        assert(!sigaction(SIGUSR1,&action,NULL));
+        provider_signal=0; provider_jump=mode==2;
+        int jumped=sigsetjmp(provider_boundary,1);
+        if (!jumped) {
+            /* EVENT_WAIT: a real signal interrupts the empty virtual device.
+             * The suite deadline detects a lost wake or an unretired owner. */
+            struct itimerspec alarm={.it_value={0,20000000}};
+            assert(!timer_settime(timer,0,&alarm,NULL));
+            long result=call(fd,buffer,size,0,0,0,nr);
+            assert(mode!=2 && provider_signal && result==(mode ? -EAGAIN : -EINTR));
+        } else assert(mode==2 && provider_signal);
+        assert(call(fd,buffer,size,0,0,0,nr)==-EAGAIN);
+    }
+    provider_jump=0;
+    assert(!timer_delete(timer) && !sigaction(SIGUSR1,&previous,NULL));
+}
+static void provider_wait_contract(void) {
+    assert(!unshare(CLONE_NEWNET));
+    int fd=open("/dev/net/tun",O_RDWR|O_CLOEXEC|O_NONBLOCK);
+    assert(fd>=0);
+    struct ifreq interface={.ifr_flags=IFF_TUN|IFF_NO_PI};
+    memcpy(interface.ifr_name,"entrytun",9);
+    assert(!discovery_fd(SYS_ioctl,fd,TUNSETIFF,(uintptr_t)&interface));
+    char bytes[64];
+    interrupted_wait_contract(fd,SYS_read,(uintptr_t)bytes,sizeof(bytes));
+    assert(!close(fd));
+    puts("PASS resident provider wait: EINTR, kernel SA_RESTART, handler longjmp and reuse");
+}
+static void *delayed_socket_send(void *argument) {
+    /* EVENT_WAIT: give the receiver a pending native IO operation; the test
+     * deadline, not this delay, detects failure of channel wakeup. */
+    struct timespec delay={0,20000000};
+    while (nanosleep(&delay,&delay)) assert(errno==EINTR);
+    int fd=*(int *)argument;
+    assert(send(fd,"ready",5,0)==5);
+    return NULL;
+}
+static void socket_discovery(int filtered) {
+    int pair[2]; assert(!socketpair(AF_UNIX,SOCK_DGRAM|SOCK_CLOEXEC,0,pair));
+    if (filtered) {
+        struct sock_filter allow=BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW);
+        struct sock_fprog program={1,&allow};
+        assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
+        assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
+    }
+    char bytes[16];
+    struct iovec vector={bytes,sizeof(bytes)};
+    struct msghdr received={.msg_iov=&vector,.msg_iovlen=1};
+    struct iovec payload={"ready",5};
+    struct msghdr sent={.msg_iov=&payload,.msg_iovlen=1};
+    md_test_syscall_fn call=md_test_syscall_site(0);
+    for (unsigned i=0;i<256;++i) {
+        assert(call(pair[0],(uintptr_t)&sent,0,0,0,0,SYS_sendmsg)==5);
+        assert(call(pair[1],(uintptr_t)&received,0,0,0,0,SYS_recvmsg)==5);
+        assert(!memcmp(bytes,"ready",5));
+    }
+    struct timeval timeout={0,20000};
+    assert(!setsockopt(pair[1],SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout)));
+    assert(call(pair[1],(uintptr_t)&received,0,0,0,0,SYS_recvmsg)==-EAGAIN);
+    timeout=(struct timeval){0};
+    assert(!setsockopt(pair[1],SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout)));
+    pthread_t sender; assert(!pthread_create(&sender,NULL,delayed_socket_send,&pair[0]));
+    assert(call(pair[1],(uintptr_t)&received,0,0,0,0,SYS_recvmsg)==5);
+    assert(!pthread_join(sender,NULL) && !memcmp(bytes,"ready",5));
+    assert(!fcntl(pair[1],F_SETFL,O_NONBLOCK));
+    interrupted_wait_contract(pair[1],SYS_recvmsg,(uintptr_t)&received,0);
+    assert(!close(pair[0]) && !close(pair[1]));
+    puts("PASS resident socket IO: messages, timeout, readiness, signals, restart and longjmp");
+}
+static void proc_discovery(int filtered) {
     int directory=open("/proc/self/ns",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
     assert(directory>=0);
+    if (filtered) {
+        struct sock_filter allow=BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW);
+        struct sock_fprog program={1,&allow};
+        assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
+        assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
+    }
     char entries[4096],first[4096];
     long expected=0;
     for (unsigned site=0;site<MD_TEST_SYSCALL_SITES;++site) {
@@ -139,7 +244,30 @@ static void proc_discovery(void) {
             assert(call(directory,(uintptr_t)entries,sizeof(entries),0,0,0,SYS_getdents64)==0);
         }
     }
+    md_test_syscall_fn call=md_test_syscall_site(0);
+    for (unsigned i=0;i<256;++i) {
+        assert(!discovery_fd(SYS_lseek,directory,0,SEEK_SET));
+        assert(call(directory,1,sizeof(entries),0,0,0,SYS_getdents64)==-EFAULT);
+        long count=call(directory,(uintptr_t)entries,sizeof(entries),0,0,0,SYS_getdents64);
+        assert(count==expected && !memcmp(entries,first,(size_t)count));
+    }
     assert(!close(directory));
+    assert(call(directory,(uintptr_t)entries,sizeof(entries),0,0,0,SYS_getdents64)==-EBADF);
+    assert(!unshare(CLONE_NEWUTS) && !sethostname("resident-lookup",15));
+    int provider=open("/proc/sys/kernel/hostname",O_RDWR|O_CLOEXEC); assert(provider>=0);
+    for (unsigned i=0;i<256;++i) {
+        assert(call(provider,(uintptr_t)entries,sizeof(entries),0,0,0,SYS_pread64)==16);
+        assert(!memcmp(entries,"resident-lookup\n",16));
+        assert(call(provider,1,sizeof(entries),0,0,0,SYS_pread64)==-EFAULT);
+        assert((discovery_fd(SYS_fcntl,provider,F_GETFL,0)&O_ACCMODE)==O_RDWR);
+        assert(!discovery_fd(SYS_lseek,provider,0,SEEK_SET));
+        assert(call(provider,(uintptr_t)entries,sizeof(entries),0,0,0,SYS_read)==16);
+        assert(!memcmp(entries,"resident-lookup\n",16));
+        assert(!discovery_fd(SYS_lseek,provider,0,SEEK_SET));
+        assert(call(provider,(uintptr_t)"resident-lookup",15,0,0,0,SYS_write)==15);
+    }
+    assert(!close(provider));
+    provider_wait_contract();
     puts("PASS native proc discovery: cold and warm sites retain directory contents, cursor and request ownership");
 }
 static void reap(pid_t child) {
@@ -160,7 +288,47 @@ static int cursor_replace(void *argument) {
 }
 static volatile sig_atomic_t cursor_signals;
 static void cursor_signal(int sig) { (void)sig; ++cursor_signals; }
-static void cursor_contracts(void) {
+static void object_queries(void) {
+    int fd=open("/dev/net/tun",O_RDWR|O_CLOEXEC); assert(fd>=0);
+    unsigned features=0;
+    for (unsigned i=0;i<64;++i) {
+        assert(!discovery_fd(SYS_ioctl,fd,TUNGETFEATURES,(uintptr_t)&features));
+        assert(features==(IFF_TUN|IFF_TAP|IFF_NO_PI|IFF_MULTI_QUEUE|IFF_VNET_HDR));
+    }
+    assert(discovery_fd(SYS_ioctl,fd,TUNGETFEATURES,1)==-EFAULT);
+    struct ifreq request={0};
+    assert(discovery_fd(SYS_ioctl,fd,TUNGETIFF,(uintptr_t)&request)==-EBADFD);
+    int other=dup(fd); assert(other>=0 && !close(fd));
+    assert(!discovery_fd(SYS_ioctl,other,TUNGETFEATURES,(uintptr_t)&features));
+    int regular=open("/tmp/object-query",O_CREAT|O_RDWR|O_TRUNC,0600); assert(regular>=0);
+    /* Android may reject this device command on the native backing before
+     * the filesystem returns ENOTTY. Reuse must match that same live file. */
+    long expected=discovery_fd(SYS_ioctl,regular,TUNGETFEATURES,(uintptr_t)&features);
+    assert(expected==-ENOTTY || expected==-EACCES);
+    assert(dup3(regular,other,O_CLOEXEC)==other);
+    long reused=discovery_fd(SYS_ioctl,other,TUNGETFEATURES,(uintptr_t)&features);
+    assert(reused==expected);
+    assert(!close(regular) && !close(other) && !unlink("/tmp/object-query"));
+    pid_t child=fork(); assert(child>=0);
+    if (!child) {
+        fd=open("/dev/net/tun",O_RDWR); assert(fd>=0);
+        assert(!discovery_fd(SYS_ioctl,fd,TUNGETFEATURES,(uintptr_t)&features));
+        struct sock_filter code[]={
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,nr)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_ioctl,0,1),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|EACCES),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)
+        };
+        struct sock_fprog program={sizeof(code)/sizeof(*code),code};
+        assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
+        assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
+        assert(discovery_fd(SYS_ioctl,fd,TUNGETFEATURES,(uintptr_t)&features)==-EACCES);
+        assert(!close(fd)); _exit(0);
+    }
+    reap(child);
+    puts("PASS object queries: immutable schema, mutable owner, copy faults, close/reuse and policy admission");
+}
+static void cursor_contracts(int signal_queries) {
     const char *name="/tmp/cursor-lease";
     int fd=open(name,O_CREAT|O_RDWR,0600); assert(fd>=0);
     assert(!close(fd));
@@ -176,12 +344,34 @@ static void cursor_contracts(void) {
         assert(discovery_fd(SYS_fcntl,fd,F_GETFD,0)==-EBADF);
     }
     fd=open(name,O_RDWR); assert(fd>=0);
+    assert(write(fd,"payload",7)==7);
+    int available=-1;
+    for (unsigned i=0;i<256;++i) {
+        assert(discovery_fd(SYS_lseek,fd,3,SEEK_SET)==3);
+        assert(!discovery_fd(SYS_ioctl,fd,FIONREAD,(uintptr_t)&available) && available==4);
+        assert(discovery_fd(SYS_ioctl,fd,FIONREAD,1)==-EFAULT);
+        assert(!discovery_fd(SYS_ioctl,fd,FIONREAD,(uintptr_t)&available) && available==4);
+    }
+    assert(write(fd,"extended",8)==8);
+    assert(!discovery_fd(SYS_ioctl,fd,FIONREAD,(uintptr_t)&available) && available==0);
+    assert(discovery_fd(SYS_lseek,fd,0,SEEK_SET)==0);
+    assert(!discovery_fd(SYS_ioctl,fd,FIONREAD,(uintptr_t)&available) && available==11);
+    assert(!ftruncate(fd,5));
+    assert(!discovery_fd(SYS_ioctl,fd,FIONREAD,(uintptr_t)&available) && available==5);
+    assert(!discovery_fd(SYS_fcntl,fd,F_SETFL,O_APPEND));
+    assert(discovery_fd(SYS_fcntl,fd,F_GETFL,0)&O_APPEND);
+    assert(!discovery_fd(SYS_fcntl,fd,F_SETFL,0));
+    assert(!(discovery_fd(SYS_fcntl,fd,F_GETFL,0)&O_APPEND));
     struct sigaction action={.sa_handler=cursor_signal,.sa_flags=SA_RESTART},previous;
     sigemptyset(&action.sa_mask);
     assert(!sigaction(SIGALRM,&action,&previous));
     struct itimerval timer={.it_interval={0,100},.it_value={0,100}};
     assert(!setitimer(ITIMER_REAL,&timer,NULL));
-    for (unsigned i=1;i<=16384;++i) assert(discovery_fd(SYS_lseek,fd,1,SEEK_CUR)==i);
+    for (unsigned i=1;i<=16384;++i) {
+        assert(discovery_fd(SYS_lseek,fd,1,SEEK_CUR)==i);
+        if (signal_queries)
+            assert(!discovery_fd(SYS_ioctl,fd,FIONREAD,(uintptr_t)&available) && available==5-(int)i);
+    }
     timer=(struct itimerval){0};
     assert(!setitimer(ITIMER_REAL,&timer,NULL) && cursor_signals>0);
     assert(!sigaction(SIGALRM,&previous,NULL)); alarm(60);
@@ -203,6 +393,8 @@ static void cursor_contracts(void) {
     char byte; assert(read(reply[0],&byte,1)==1);
     assert(discovery_fd(SYS_fcntl,fd,F_GETFD,0)==FD_CLOEXEC);
     assert(discovery_fd(SYS_lseek,fd,0,SEEK_CUR)==-ESPIPE);
+    assert(write(replacement[1],"pipe",4)==4);
+    assert(!discovery_fd(SYS_ioctl,fd,FIONREAD,(uintptr_t)&available) && available==4);
     assert(write(command[1],"x",1)==1);
     reap(child); assert(!munmap(stack,size));
     assert(!close(fd));
@@ -212,8 +404,19 @@ static void cursor_contracts(void) {
         fd=open(name,O_RDWR); assert(fd>=0);
         assert(discovery_fd(SYS_lseek,fd,0,SEEK_SET)==0);
         assert(discovery_fd(SYS_lseek,fd,1,SEEK_CUR)==1);
+        struct sock_filter allow=BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW);
+        struct sock_fprog initial={1,&allow};
+        assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
+        assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&initial));
+        /* Installation revokes the open-time view. Repeated queries must
+         * reclassify the live descriptor, not depend on a preceding open. */
+        for (unsigned i=0;i<128;++i) {
+            assert(!discovery_fd(SYS_ioctl,fd,FIONREAD,(uintptr_t)&available) && available==4);
+            assert(discovery_fd(SYS_ioctl,fd,FIONREAD,1)==-EFAULT);
+        }
         struct sock_filter code[]={
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,nr)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_ioctl,2,0),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_lseek,1,0),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_fcntl,0,1),
             BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|EACCES),
@@ -226,11 +429,12 @@ static void cursor_contracts(void) {
             assert(discovery_fd(SYS_lseek,fd,1,SEEK_CUR)==-EACCES);
             assert(discovery_fd(SYS_fcntl,fd,F_GETFD,0)==-EACCES);
             assert(discovery_fd(SYS_fcntl,fd,F_SETFD,0)==-EACCES);
+            assert(discovery_fd(SYS_ioctl,fd,FIONREAD,(uintptr_t)&available)==-EACCES);
         }
         assert(!close(fd)); _exit(0);
     }
     reap(child); assert(!unlink(name));
-    puts("PASS native cursor lease: flags, FD reuse, signal-exact offsets, shared-table replacement and seccomp revocation");
+    puts("PASS native cursor lease: live size/status/offset, flags, copy faults, FD reuse, signal-exact offsets, shared-table replacement and seccomp revocation");
 }
 struct jit_entry_peer { atomic_int stage; };
 static void jit_stage(struct jit_entry_peer *peer,int stage) {
@@ -361,6 +565,35 @@ static void filter(unsigned flags) {
     assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
     assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,flags,&program));
 }
+static void native_payload(int filtered) {
+    int pair[2]; assert(!socketpair(AF_UNIX,SOCK_DGRAM|SOCK_CLOEXEC,0,pair));
+    if (filtered) {
+        struct sock_filter code[]={
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,nr)),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_sendto,1,0),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_recvfrom,0,3),
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,args[3])),
+            BPF_JUMP(BPF_JMP|BPF_JSET|BPF_K,MSG_PEEK,0,1),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|EACCES),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
+        struct sock_fprog program={sizeof(code)/sizeof(*code),code};
+        assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
+        assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
+    }
+    md_test_syscall_fn call=md_test_syscall_site(0);
+    char sent='s',received=0;
+    for (unsigned i=0;i<1024;++i) {
+        assert(call(pair[0],(uintptr_t)&sent,1,MSG_DONTWAIT,0,0,SYS_sendto)==1);
+        assert(call(pair[1],(uintptr_t)&received,1,MSG_DONTWAIT,0,0,SYS_recvfrom)==1 && received==sent);
+    }
+    if (filtered) {
+        assert(call(pair[0],(uintptr_t)&sent,1,MSG_DONTWAIT|MSG_PEEK,0,0,SYS_sendto)==-EACCES);
+        assert(call(pair[1],(uintptr_t)&received,1,MSG_DONTWAIT|MSG_PEEK,0,0,SYS_recvfrom)==-EACCES);
+    }
+    assert(call(pair[1],(uintptr_t)&received,1,MSG_DONTWAIT,0,0,SYS_recvfrom)==-EAGAIN);
+    assert(!close(pair[0]) && !close(pair[1]));
+    printf("PASS native payload: filtered=%d, exact transfer, argument denial and empty queue\n",filtered);
+}
 static pthread_barrier_t filter_barrier;
 static void *filtered_exec(void *executable) {
     struct sock_filter code[]={
@@ -389,7 +622,7 @@ static void filter_exec(const char *executable) {
         }
         reap(child);
     }
-    puts("PASS filter exec: leader and nonleader retain registration revocation");
+    puts("PASS filter exec: leader and nonleader retain policy and internal registration");
 }
 static void barrier(pthread_barrier_t *value) {
     int result=pthread_barrier_wait(value); assert(!result || result==PTHREAD_BARRIER_SERIAL_THREAD);
@@ -401,7 +634,7 @@ static void *filtered_peer(void *unused) {
     barrier(&filter_barrier); barrier(&filter_barrier);
     assert(stat_try(&local,&st,&result)==MD_ENTRY_COMPLETED && result==-EACCES);
     assert(stat_try(&fresh,&st,&result)==MD_ENTRY_COMPLETED && result==-EACCES);
-    assert((fresh.opaque[MD_ENTRY_CLIENT_CONTROL]>>1)==UINT32_MAX);
+    assert(fresh.opaque[MD_ENTRY_CLIENT_CHANNEL]);
     assert(syscall(SYS_newfstatat,AT_FDCWD,path,&st,0)==-1 && errno==EACCES);
     return NULL;
 }
@@ -423,9 +656,11 @@ static void filters(void) {
     reap(child); puts("PASS cooperative entry: TSYNC peer/fresh clients use kernel admission without forbidden helper syscalls");
 }
 static long required_call(struct md_entry_client *local,int nr,const uint64_t args[6]) {
-    struct md_entry_call call={.number=nr};
-    memcpy(call.args,args,sizeof(call.args));
-    assert(md_entry_invoke(api,local,&call)==MD_ENTRY_COMPLETED);
+    struct md_entry_call call=caller_request(nr,args);
+    enum md_entry_outcome outcome=md_entry_invoke(api,local,&call);
+    if (outcome!=MD_ENTRY_COMPLETED)
+        fprintf(stderr,"required call nr=%d outcome=%d result=%ld\n",nr,outcome,(long)call.result);
+    assert(outcome==MD_ENTRY_COMPLETED);
     return call.result;
 }
 static void scalar_credentials(void) {
@@ -449,9 +684,9 @@ static void scalar_credentials(void) {
             for (unsigned i=0;i<4;++i) {
                 uint64_t sequence=channel->sequence;
                 long result=required_call(&local,calls[i],(uint64_t[6]){0});
-                if (round<3) assert(channel->sequence==sequence+1);
-                /* Native comparison can itself use lazy machine entry and
-                 * the same thread channel. Check this call's increment first. */
+                assert(channel->sequence==sequence+(round==3));
+                /* Published scalars need no request. An unfinished namespace
+                 * map retains live translation through the shared owner. */
                 assert(result==syscall(calls[i]));
             }
         }
@@ -626,6 +861,11 @@ static void task_completion(void) {
     struct utsname names;
     assert(!required_call(local,SYS_uname,(uint64_t[]){(uintptr_t)&names,0,0,0,0,0}));
     assert(!strcmp(names.sysname,"Linux"));
+    struct md_entry_channel *view=(void *)local->opaque[MD_ENTRY_CLIENT_CHANNEL];
+    uint64_t sequence=view->sequence;
+    struct md_entry_call query=caller_request(SYS_uname,(uint64_t[6]){(uintptr_t)&names});
+    assert(api->try_identified(local,api->thread_identity(),&query)==MD_ENTRY_COMPLETED && !query.result);
+    assert(view->sequence==sequence && !strcmp(names.sysname,"Linux"));
     assert(required_call(local,SYS_getuid,(uint64_t[6]){0})==0);
     int pair[2];
     assert(!required_call(local,SYS_pipe2,(uint64_t[]){(uintptr_t)pair,O_CLOEXEC,0,0,0,0}));
@@ -879,6 +1119,8 @@ static void native_xattr_pins(void) {
                 assert(!seteuid(identity));
                 long result=required_call(&local,SYS_getxattr,
                     (uint64_t[]){(uintptr_t)name,(uintptr_t)attribute,(uintptr_t)bytes,sizeof(bytes),0,0});
+                if (identity==1000 ? result!=5 || memcmp(bytes,"first",5) : result!=-EACCES)
+                    fprintf(stderr,"xattr pin promoted=%u euid=%u result=%ld\n",promoted,identity,result);
                 assert(identity==1000 ? result==5 && !memcmp(bytes,"first",5) : result==-EACCES);
                 assert(!seteuid(0));
             }
@@ -953,6 +1195,9 @@ static void filter_arguments(void) {
         struct sock_fprog program={sizeof(code)/sizeof(*code),code};
         assert(!prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0));
         assert(!syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,0,&program));
+        struct md_entry_call unknown={.number=SYS_openat,
+            .args={AT_FDCWD,(uintptr_t)path,O_RDWR|O_TRUNC}};
+        assert(md_entry_invoke(api,&local,&unknown)==MD_ENTRY_DECLINED);
         assert(required_call(&local,SYS_openat,(uint64_t[]){AT_FDCWD,(uintptr_t)path,O_RDWR|O_TRUNC,0,0,0})==-EACCES);
         assert(stat_try(&local,&st,&result)==MD_ENTRY_COMPLETED && !result && st.st_size==7);
         int fd=required_call(&local,SYS_openat,(uint64_t[]){AT_FDCWD,(uintptr_t)path,O_RDONLY,0,0,0});
@@ -961,7 +1206,6 @@ static void filter_arguments(void) {
     }
     reap(child); puts("PASS cooperative entry: seccomp argument denial precedes mutation; allowed metadata/open still complete");
 }
-extern char entry_test_kernel_return[];
 __attribute__((noinline)) static long caller_kernel(long number,const uint64_t *args) {
     register long x8 __asm__("x8")=number;
     register long x0 __asm__("x0")=args[0], x1 __asm__("x1")=args[1], x2 __asm__("x2")=args[2];
@@ -1016,9 +1260,9 @@ static void capacity(void) {
         barrier(&capacity_barrier);
         for (unsigned i=0;i<16;++i) assert(!pthread_join(peers[i],NULL));
         assert(!pthread_barrier_destroy(&capacity_barrier));
-        assert(atomic_load(&capacity_completed)==7 && atomic_load(&capacity_declined)==9);
+        assert(atomic_load(&capacity_completed)==16 && !atomic_load(&capacity_declined));
     }
-    puts("PASS cooperative entry: bounded channel exhaustion falls back; exited threads release all seven borrowed slots");
+    puts("PASS cooperative entry: concurrent channels grow and are reused after thread exit");
 }
 struct reader_burst {
     pthread_barrier_t ready;
@@ -1042,9 +1286,13 @@ static void *burst_reader(void *argument) {
         assert(!installed);
         assert(syscall(SYS_getppid)==-1 && errno==EACCES);
     }
+    /* A peer's filter installation may temporarily revoke shared admission.
+     * Require channels after all policies commit, then stress reader/writer
+     * fairness independently of that transition. */
+    barrier(&burst->ready);
     struct md_entry_client local={0}; struct stat st; long result;
     assert(stat_try(&local,&st,&result)==MD_ENTRY_COMPLETED && !result);
-    assert(!!local.opaque[MD_ENTRY_CLIENT_CHANNEL]==!burst->filtered);
+    assert(local.opaque[MD_ENTRY_CLIENT_CHANNEL]);
     barrier(&burst->ready);
     unsigned calls=0;
     do {
@@ -1063,10 +1311,11 @@ static void reader_writer_bursts(void) {
         assert(!pthread_barrier_init(&burst.ready,NULL,4));
         for (unsigned i=0;i<3;++i) assert(!pthread_create(&readers[i],NULL,burst_reader,&burst));
         barrier(&burst.ready);
+        barrier(&burst.ready);
         if (filtered) {
             struct md_entry_client fresh={0}; struct stat st; long result;
             assert(stat_try(&fresh,&st,&result)==MD_ENTRY_COMPLETED && !result);
-            assert(!fresh.opaque[MD_ENTRY_CLIENT_CHANNEL]);
+            assert(fresh.opaque[MD_ENTRY_CLIENT_CHANNEL]);
             struct md_entry_channel *registered=(void *)client.opaque[MD_ENTRY_CLIENT_CHANNEL];
             assert(registered && atomic_load(&registered->enabled));
         }
@@ -1146,7 +1395,45 @@ static volatile sig_atomic_t escape_armed;
 static atomic_int escape_running;
 static void escape_handler(int signal) {
     (void)signal;
-    if (escape_armed) siglongjmp(escape,1);
+    if (escape_armed) {
+        /* siglongjmp may unblock another signal before restoring the stack. */
+        escape_armed=0;
+        siglongjmp(escape,1);
+    }
+}
+static void failed_frame_handler(int signal) { (void)signal; _exit(92); }
+static void failed_frame_recover(int signal,siginfo_t *info,void *context) {
+    (void)context;
+    assert(signal==SIGSEGV && info->si_code==SI_KERNEL);
+    sigset_t mask; assert(!sigprocmask(SIG_SETMASK,NULL,&mask));
+    assert(!sigismember(&mask,SIGUSR2) && !sigismember(&mask,SIGSYS));
+    struct sigaction action;
+    assert(!sigaction(SIGUSR2,NULL,&action) && action.sa_handler==SIG_DFL);
+    _exit(0);
+}
+static void failed_signal_frame(void) {
+    for (unsigned mode=0;mode<3;++mode) {
+        pid_t child=fork(); assert(child>=0);
+        if (!child) {
+            size_t size=65536;
+            void *memory=mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+            assert(memory!=MAP_FAILED);
+            stack_t stack={.ss_sp=memory,.ss_size=size}; assert(!sigaltstack(&stack,NULL));
+            struct sigaction action={.sa_handler=failed_frame_handler,.sa_flags=SA_ONSTACK|SA_RESETHAND};
+            sigemptyset(&action.sa_mask); sigaddset(&action.sa_mask,SIGSYS);
+            int signal=mode==2 ? SIGSEGV : SIGUSR2;
+            assert(!sigaction(signal,&action,NULL));
+            if (mode==1) {
+                action=(struct sigaction){.sa_sigaction=failed_frame_recover,.sa_flags=SA_SIGINFO};
+                sigemptyset(&action.sa_mask); assert(!sigaction(SIGSEGV,&action,NULL));
+            }
+            raise(signal); _exit(93);
+        }
+        int status; assert(waitpid(child,&status,0)==child);
+        if (mode==1) assert(WIFEXITED(status) && !WEXITSTATUS(status));
+        else assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSEGV);
+    }
+    puts("PASS signal frame failure: guest SIGSEGV, recovery and action reset without supervisor failure");
 }
 static void *escape_sender(void *unused) {
     (void)unused;
@@ -1487,13 +1774,14 @@ static void filtered_close(void) {
     pid_t child=fork(); assert(child>=0);
     if (!child) {
         int fd=open(path,O_RDONLY); assert(fd>=0 && fd<190);
-        assert(dup2(fd,190)==190 && dup2(fd,191)==191 && !close(fd));
+        assert(dup2(fd,190)==190 && dup2(fd,191)==191 && dup2(fd,192)==192 && !close(fd));
         struct sock_filter instructions[]={
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,nr)),
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_close,0,4),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_close,0,5),
             BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,args[0])),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,191,0,1),
             BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|EPERM),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,192,0,1),
             BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_TRACE|MD_INTERCEPT_CLOSE|191),
             BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)
         };
@@ -1502,9 +1790,11 @@ static void filtered_close(void) {
         assert(!prctl(PR_SET_SECCOMP,SECCOMP_MODE_FILTER,&program));
         assert(!close(190));
         assert(close(191)==-1 && errno==EPERM);
+        assert(close(192)==-1 && errno==ENOSYS);
         struct stat st;
         assert(fstat(190,&st)==-1 && errno==EBADF);
         assert(!fstat(191,&st) && st.st_size==7);
+        assert(!fstat(192,&st) && st.st_size==7);
         assert(close(-1)==-1 && errno==EBADF);
         _exit(0);
     }
@@ -1515,6 +1805,7 @@ static enum md_entry_outcome identified_entry(struct md_entry_client *owner,stru
     return api->try_identified(owner,api->thread_identity(),call);
 }
 static void contracts(const char *executable) {
+    assert(offsetof(struct md_entry_channel,descriptor)<64);
     assert(sizeof(struct md_entry_client)==3*sizeof(uintptr_t));
     struct md_entry_api invalid=*api;
     assert(md_entry_api_valid(&invalid));
@@ -1531,7 +1822,7 @@ static void contracts(const char *executable) {
     assert(!md_entry_offered(api,api->syscall_count,MD_ENTRY_ORDINARY));
     for (unsigned nr=0;nr<api->syscall_count;++nr) {
         enum md_entry_route route=md_entry_route(nr);
-        assert(!!md_entry_offered(api,nr,MD_ENTRY_ORDINARY)==(route!=MD_ENTRY_CALLER));
+        assert(md_entry_offered(api,nr,MD_ENTRY_ORDINARY));
         assert(!!md_entry_offered(api,nr,MD_ENTRY_CANCELLATION)==(route==MD_ENTRY_FD));
         assert(!!md_entry_offered(api,nr,MD_ENTRY_NATIVE_MEMORY)==(route==MD_ENTRY_MEMORY));
     }
@@ -1581,9 +1872,17 @@ static void contracts(const char *executable) {
     strict_reentry=1;
     client.opaque[MD_ENTRY_CLIENT_CONTROL]=MD_ENTRY_CLIENT_BUSY;
     assert(!raise(SIGUSR1) && signals==1);
+    assert(call6(SYS_getpid,0,0,0,0,0,0)>0);
     client.opaque[MD_ENTRY_CLIENT_CONTROL]=0; strict_reentry=0;
-    struct md_entry_call unsupported={.number=SYS_clone};
+    struct md_entry_call unsupported={.number=api->syscall_count};
     assert(md_entry_invoke(api,&client,&unsupported)==MD_ENTRY_DECLINED);
+    const int context_calls[]={SYS_clone,SYS_rt_sigreturn,SYS_ioctl,SYS_wait4};
+    for (unsigned i=0;i<sizeof(context_calls)/sizeof(*context_calls);++i) {
+        struct md_entry_call context=caller_request(context_calls[i],(uint64_t[6]){0});
+        assert(api->try_syscall(&client,&context)==MD_ENTRY_KERNEL_CALL);
+        assert(context.kernel==caller_kernel && !context.next);
+        assert(!(client.opaque[MD_ENTRY_CLIENT_CONTROL]&MD_ENTRY_CLIENT_BUSY));
+    }
     pid_t child=fork(); assert(child>=0);
     if (!child) {
         struct md_entry_channel *inherited=(void *)client.opaque[MD_ENTRY_CLIENT_CHANNEL];
@@ -1608,7 +1907,7 @@ static void contracts(const char *executable) {
     pthread_t peers[4];
     for (unsigned i=0;i<4;++i) assert(!pthread_create(&peers[i],NULL,threaded,NULL));
     for (unsigned i=0;i<4;++i) assert(!pthread_join(peers[i],NULL));
-    capacity(); interrupted(); abandoned_memory(); jit_entry_resume(); context_changes(); credentials(); pid_namespace(); landlocked(); teardown();
+    capacity(); interrupted(); failed_signal_frame(); abandoned_memory(); jit_entry_resume(); context_changes(); credentials(); pid_namespace(); landlocked(); teardown();
     assert(!prctl(PR_SET_DUMPABLE,0));
     assert(!call6(SYS_newfstatat,AT_FDCWD,(uintptr_t)path,(uintptr_t)&st,0,0,0) && st.st_size==7);
     struct md_entry_channel *channel=(void *)client.opaque[MD_ENTRY_CLIENT_CHANNEL];
@@ -1622,8 +1921,6 @@ static void contracts(const char *executable) {
     assert(!prctl(PR_SET_DUMPABLE,1));
     puts("PASS cooperative protected copy: existing/fresh channels use sequence-bound input and output without remote memory access");
     filters(); filter_exec(executable);
-    /* A thread-local filter closes new registration for this image, even after
-     * that thread exits. Verify capacity before this irreversible admission. */
     reader_writer_bursts();
     assert(!call6(SYS_renameat2,AT_FDCWD,(uintptr_t)path,AT_FDCWD,(uintptr_t)"/tmp/cooperative-renamed",0,0));
     assert(!call6(SYS_unlinkat,AT_FDCWD,(uintptr_t)"/tmp/cooperative-renamed",0,0,0,0));
@@ -1659,11 +1956,18 @@ int main(int argc,char **argv) {
     assert(!sigaction(SIGUSR2,&action,NULL));
     api=(void *)getauxval(MD_AT_COOPERATIVE);
     assert(md_entry_api_valid(api));
+    if (argc==3 && !strcmp(argv[1],"--native-payload")) {
+        native_payload(atoi(argv[2])); return 0;
+    }
     if (argc>1 && !strcmp(argv[1],"--filtered-exec")) {
         struct stat st; long result;
         assert(stat_try(&client,&st,&result)==MD_ENTRY_COMPLETED && !result);
-        assert((client.opaque[MD_ENTRY_CLIENT_CONTROL]>>1)==UINT32_MAX);
-        puts("PASS inherited filter: fresh client uses kernel without registration"); return 0;
+        assert(client.opaque[MD_ENTRY_CLIENT_CHANNEL]);
+        pid_t child=fork(); assert(child>=0);
+        if (!child) { syscall(SYS_gettid,MD_ENTRY_BIND); _exit(99); }
+        int status; assert(waitpid(child,&status,0)==child);
+        assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGSYS);
+        puts("PASS inherited filter: internal registration preserves application SIGSYS"); return 0;
     }
     if (argc>1 && (!strcmp(argv[1],"--initial-stack") || !strcmp(argv[1],"--stack-empty"))) {
         initial_stack(argc,argv,!strcmp(argv[1],"--stack-empty")); return 0;
@@ -1671,14 +1975,23 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--fd-discovery")) {
         fd_discovery(); return 0;
     }
-    if (argc>1 && !strcmp(argv[1],"--cursor-lease")) {
-        cursor_contracts(); return 0;
+    if (argc>1 && (!strcmp(argv[1],"--cursor-lease") || !strcmp(argv[1],"--cursor-signals"))) {
+        cursor_contracts(!strcmp(argv[1],"--cursor-signals")); return 0;
+    }
+    if (argc>1 && !strcmp(argv[1],"--object-queries")) {
+        object_queries(); return 0;
+    }
+    if (argc>1 && !strcmp(argv[1],"--xattr-pins")) {
+        native_xattr_pins(); return 0;
     }
     if (argc>1 && !strcmp(argv[1],"--site-discovery")) {
         site_discovery(); return 0;
     }
     if (argc>1 && !strcmp(argv[1],"--proc-discovery")) {
-        proc_discovery(); return 0;
+        proc_discovery(argc>2 && atoi(argv[2])); return 0;
+    }
+    if (argc>1 && !strcmp(argv[1],"--socket-discovery")) {
+        socket_discovery(argc>2 && atoi(argv[2])); return 0;
     }
     if (argc>1 && !strcmp(argv[1],"--jit-busy")) {
         int fd=open(path,O_CREAT|O_RDWR,0600); assert(fd>=0 && write(fd,"payload",7)==7 && !close(fd));
@@ -1691,6 +2004,11 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--native-signals")) {
         int fd=open(path,O_CREAT|O_RDWR,0600); assert(fd>=0 && write(fd,"payload",7)==7 && !close(fd));
         native_interruptions(); return 0;
+    }
+    if (argc>1 && !strcmp(argv[1],"--signal-abandon")) {
+        failed_signal_frame();
+        int fd=open(path,O_CREAT|O_RDWR,0600); assert(fd>=0 && write(fd,"payload",7)==7 && !close(fd));
+        abandoned_memory(); return 0;
     }
     if (argc>1 && (!strcmp(argv[1],"--birth-retirement") || !strcmp(argv[1],"--bursts"))) {
         int fd=open(path,O_CREAT|O_RDWR,0600); assert(fd>=0 && write(fd,"payload",7)==7 && !close(fd));

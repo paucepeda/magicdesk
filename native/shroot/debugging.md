@@ -16,9 +16,11 @@ it never attaches to Android processes or transfers the supervisor's authority
 to the debugger. Ordinary execution allocates no inferior or debugger-wait records.
 
 `PTRACE_TRACEME` selects the guest parent; `ATTACH` and `SEIZE` select an existing
-inferior in the same supervised launch. Requests validate launch membership,
-guest real/effective/saved UID and GID, the debugger's domain and the kernel's
-remote-memory permissions. A traced image cannot gain admitted set-ID credentials
+inferior in the same supervised launch. Attach admission validates launch membership,
+guest real/effective/saved UID and GID, logical dumpability and the debugger's domain.
+Voluntary `TRACEME` checks the parent's capability authority without requiring
+the child to be dumpable. Native memory access remains bounded by the kernel's
+permissions. A traced image cannot gain admitted set-ID credentials
 on exec. Register and memory access requires a stopped, owned inferior.
 An established relationship survives the inferior's UID/GID changes: register
 inspection, continuation and detach check the existing owner, not new-attach
@@ -27,7 +29,7 @@ native kernel access ceiling.
 
 Exec admission always selects the distribution's original `PT_INTERP`.
 Stock `libthread_db` matches libc's private thread layout and realtime signal
-handling. Debugger ownership revokes lazy SVC entry in the inferior; other
+handling. Debugger ownership suspends lazy SVC entry in the inferior; other
 untraced processes retain their normal admission. This is shared by all
 distributions and needs no GDB wrapper or sandbox override.
 
@@ -47,6 +49,20 @@ Supported requests include register sets, memory peek/poke, signal information
 and masks, continue, single step, syscall entry/exit information, interrupt,
 listen, detach, kill, event messages and fork/vfork/clone/exec/exit options.
 Attach/interrupt stops are published at a guest boundary, outside adapter code.
+Stop demand survives intermediate preparation and borrowed-task stops. Before
+an interruptible service wait resumes, an outstanding debugger stop is handed
+to that wait's cancellation owner. Provider waits distinguish that interruption
+from data readiness; a pending stop cannot cause a resume/interrupt loop while
+waiting for data that the debugger itself will supply after detach.
+A resident native call uses its effect journal
+to restore the original context, including the interval between publication and
+kernel entry. EVENT_STOP recovery uses the kernel's completed restart decision;
+signal-delivery recovery keeps the native PC until that decision commits.
+Recovery and guest register writes use the same continuation decoder, so a
+restored application PC cannot retain a service checkpoint's execution scope.
+Lazy SVC admission is suspended for the shared address space, not permanently
+disabled. The last detach or debugger exit permits lazy re-admission through
+the same registry owner, subject to independent filter and mapping constraints.
 An inferior's unmaskable SIGSTOP also waits for that boundary, after its internal
 file-table and filesystem turns finish. Its original siginfo belongs to the
 debugger relationship; suppressing the stop does not group-stop the application
@@ -76,9 +92,16 @@ An internal return checkpoint is not a guest syscall, even when the adapter
 phase itself is idle. Pending signal carriers wait for the native syscall-exit
 record; restored signal-delivery stops then pass through ordinary debugger
 admission before recipient-namespace translation. Their restored provenance
-also prevents another interrupted-syscall probe: on nondumpable tasks that
-probe itself needs a guest memory-read helper and must not defer the same
-signal indefinitely.
+also prevents another interrupted-syscall probe: a host-denied memory read
+can need a task-local helper and must not defer the same signal indefinitely.
+
+Under inherited host seccomp, a syscall-exit stop can precede the SIGSYS that
+admits its adapter. For an actively syscall-traced guest, the coordinator checks
+the pending signal's exact syscall/PC and original guest policy before deferring
+that exit. The same interception policy selects translation and completion;
+the debugger receives the final result once. Guest TRAP and unsupported native
+calls retain exit-before-signal ordering. Untraced calls and executors without
+host-SIGSYS translation do not scan the signal queue.
 
 ## Waits And Process Identity
 
@@ -93,8 +116,8 @@ timer, helper thread or additional descriptor is allocated. Guest signals use
 the shared syscall-restart path: the original wait number, arguments and kernel
 orig_x0 are restored before the kernel decides EINTR or SA_RESTART. The old wait
 record is released before a handler can issue another wait. If no virtual
-children remain, a blocking wait returns to the kernel with ordinary signal
-semantics. The debugger's own syscall filters also apply to the wait carrier;
+children or matching private actors remain, a blocking wait returns to the kernel
+with ordinary signal semantics. The debugger's own syscall filters also apply to the wait carrier;
 a denied operation remains an error. Kernel parenthood retains real-child exit
 reaping; traced nonchildren have supervisor-owned exit
 records. Event waits end on a trace event, owned child exit or launch cancellation,
@@ -102,6 +125,16 @@ not a settling delay. Nonleader thread termination belongs to the virtual trace
 relationship: the native parent cannot reap it as an ordinary child of the
 debugger while the supervisor remains the kernel ptracer. Only a process leader
 with actual parenthood can use native child reaping.
+
+The same owner excludes retained-memory actors from guest waits. It snapshots
+visible real-child candidates once per wake round and probes exact PIDs; the
+kernel still enforces __WNOTHREAD and wait-class eligibility. No eligible child
+means ECHILD, even if a private actor remains alive. Child stop/continue events
+wake existing waiters without fabricating SIGCHLD. NULL waitid output borrows a
+shared buffer only for the nonblocking probe, so consuming an event remains
+distinguishable from WNOHANG returning no event. Pool exhaustion parks through
+the existing continuation queue; completion/cancellation releases the lease.
+Unrelated native waits allocate no candidate list or output buffer.
 
 A debugger may share a descriptor table with its inferior through `CLONE_FILES`,
 as crash collectors do. Publishing a virtual descriptor must install its selector
@@ -148,8 +181,9 @@ The kernel TRACEEXIT option serves two independent owners: requested inferior
 events and runtime terminal descriptor publication. A task's first internal
 O_PATH capture enables the latter once for its lifetime; debugger detach cannot
 revoke it. Only requested events enter the guest debugger queue. Syscall stepping
-observes only explicit syscall-traced inferiors and active debugger owners
-(including their native waitid calls). Ordinary launches do not acquire debugger
+observes only explicit syscall-traced inferiors. Debugger owners' wait4/waitid
+calls use the shared seccomp selector after application policy; their other
+native syscalls do not require stepping. Ordinary launches do not acquire debugger
 per-syscall stepping, rusage snapshots, polling or wait records. Their internal
 terminal observation is described in [interception](interception.md).
 Aggregate `--statistics` counters can verify these boundaries.
@@ -205,6 +239,9 @@ open arguments and child creation, and rejects stray exec-event recovery.
 The `strace-detach` case attaches to 41 idle threads, observes a stable wait,
 sends SIGINT and requires prompt tracer exit without killing the target. The
 target must then accept input, release its workers and exit normally.
+`gdb-attach-poll` and `gdb-attach-epoll` check blocked native and mixed-provider
+readiness, the original caller's backtrace, a register-visible data edit and
+continued input after detach.
 `gdb-attach-fork` inherits an admitted readiness selector, attaches to 41 threads,
 waits for GDB's idle native poll, then requires four fork/exec detachments and
 normal target/debugger exit. `--machine-entry --pid-namespace` checks the

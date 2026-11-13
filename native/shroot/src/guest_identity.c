@@ -54,6 +54,10 @@ int md_identity_in_group(const struct md_identity *v, uint32_t gid) {
     return v->groups && bsearch(&gid, v->groups->ids, v->groups->count,
         sizeof(gid), compare_gid) != NULL;
 }
+int md_identity_traceme(const struct md_identity *parent,const struct md_identity *child) {
+    return (parent->user_namespace==child->user_namespace && !(child->caps.permitted&~parent->caps.permitted))
+        || md_identity_capable_in(parent,child->user_namespace,CAP_SYS_PTRACE);
+}
 int md_identity_may_inspect(const struct md_identity *from, const struct md_identity *to, int filesystem) {
     if (md_identity_capable_in(from,to->user_namespace,CAP_SYS_PTRACE)) return 1;
     uint32_t uid=filesystem ? from->uid.fs : from->uid.real;
@@ -121,8 +125,10 @@ static void uid_changed(struct md_identity *v, const struct md_identity_ids *old
     }
     if (old->effective==root && v->uid.effective!=root) v->caps.effective = 0;
     if (old->effective!=root && v->uid.effective==root) v->caps.effective = v->caps.permitted;
-    uint64_t fs = (1ULL << CAP_CHOWN) | (1ULL << CAP_DAC_OVERRIDE)
-        | (1ULL << CAP_FOWNER) | (1ULL << CAP_FSETID);
+    /* Linux CAP_FS_SET applies to every fsuid transition, including setresuid. */
+    uint64_t fs = (1ULL << CAP_CHOWN) | (1ULL << CAP_DAC_OVERRIDE) | (1ULL << CAP_DAC_READ_SEARCH)
+        | (1ULL << CAP_FOWNER) | (1ULL << CAP_FSETID) | (1ULL << CAP_LINUX_IMMUTABLE)
+        | (1ULL << CAP_MKNOD) | (1ULL << CAP_MAC_OVERRIDE);
     if (old->fs==root && v->uid.fs!=root) v->caps.effective &= ~fs;
     if (old->fs!=root && v->uid.fs==root) v->caps.effective |= v->caps.permitted & fs;
 }

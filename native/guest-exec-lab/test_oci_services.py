@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stock OCI entrypoints and persistent services through the installed shell runtime.
+"""Stock OCI entrypoints and persistent services through the selected runtime.
 
 Run on the Android device hosting the configured local MCP endpoint. Python only
-controls fixtures; every Linux process runs through the APK's UID 2000 executor.
+controls fixtures; every Linux process retains the explicitly selected executor.
 Services bind loopback, use private instances and leave no running processes.
 """
 import argparse
@@ -23,6 +23,7 @@ import time
 import tomllib
 import uuid
 from kernel_profile import KernelProfile
+from fixture_executor import FixtureExecutor, probe_native_capability
 
 NAMES = ('nginx', 'redis', 'postgres', 'python', 'node', 'caddy', 'mariadb',
          'httpd', 'memcached', 'java', 'php', 'ruby', 'dotnet')
@@ -32,7 +33,8 @@ class Server:
     def __init__(self, suite, argv, timeout=180):
         self.suite = suite
         self.client = suite.new_client()
-        self.console = self.client.call('console.open', {'directory': suite.base})['sessionId']
+        self.executor = FixtureExecutor(self.client, suite.transport, suite.output.parent,
+                                        suite.executor.mode, 'server')
         self.lines = queue.Queue()
         self.log = []
         self.result = None
@@ -46,6 +48,7 @@ class Server:
         self.command = 'set -o pipefail\n' + shlex.join(['timeout', str(timeout), *argv])
         self.command += ' 2>&1 | /system/bin/toybox nc -w 10 127.0.0.1 '
         self.command += str(self.listener.getsockname()[1])
+        self.command = suite.kernel_profile.shell(self.command)
         self.connection = None
         self.reader = threading.Thread(target=self.read)
         self.process = threading.Thread(target=self.execute)
@@ -54,9 +57,7 @@ class Server:
 
     def execute(self):
         try:
-            self.result = self.client.call('console.execute',
-                                          {'sessionId': self.console, 'command': self.command},
-                                          deadline=time.monotonic() + self.timeout + 30)
+            self.result = self.executor.execute(self.command, self.timeout + 15)
         except Exception as error:
             self.error = str(error)
         finally:
@@ -96,7 +97,9 @@ class Server:
         assert self.result['exitCode'] == expected, self.result
 
     def close(self):
-        self.suite.client.call('console.close', {'sessionId': self.console})
+        self.executor.cancel()
+        if self.executor.mode == 'shell':
+            self.executor.close()
         # EVENT_WAIT: cancellation/EOF drains log and command owners before fixture exit.
         self.process.join(30)
         if self.connection:
@@ -106,6 +109,9 @@ class Server:
                 pass
         self.listener.close()
         self.reader.join(25)
+        if self.executor.mode == 'app' and not self.process.is_alive():
+            self.executor.execute(shlex.join(['rmdir', self.executor.root]))
+            self.executor.close()
         self.suite.report['servers'].append({'command': self.command, 'log': ''.join(self.log),
                                             'result': self.result, 'error': self.error})
         assert not self.process.is_alive() and not self.reader.is_alive(), 'fixture owner still active'
@@ -121,7 +127,12 @@ def add_machine_entry_argument(parser):
 
 
 class Suite:
-    def __init__(self, output, build=None, machine_entry=None, kernel_profile=None, session=None):
+    def __init__(self, output, build=None, machine_entry=None, kernel_profile=None, session=None, executor=None):
+        if session is not None:
+            selected = session.get('executor', {}).get('mode', 'shell')
+            if executor is not None and executor != selected:
+                raise ValueError('Retained session executor cannot be changed')
+            executor = selected
         if session is not None and kernel_profile is None:
             kernel_profile = os.environ.get('SHROOT_TEST_KERNEL_PROFILE',
                 session.get('kernelProfile', {}).get('profile', 'native'))
@@ -136,12 +147,12 @@ class Suite:
         self.config = tomllib.loads((Path.home() / '.codex/config.toml').read_text())['mcp_servers']['magicdesk']
         self.client = self.new_client()
         state = self.client.call('get_state')
-        assert state['shell']['uid'] == 2000, state['shell']
+        self.executor = FixtureExecutor(self.client, self.transport, output, executor, 'oci-services')
         tag = uuid.uuid4().hex
-        self.base = '/data/local/tmp/md-oci-services-' + tag
+        self.base = self.executor.root
         self.output = output / ('oci-services-' + tag + '.json')
         self.report = {'id': tag, 'directory': self.base, 'app': state['app'], 'device': state['device'],
-                       'uid': 2000, 'images': [], 'commands': [], 'servers': [], 'cases': [], 'passed': False}
+                       'uid': self.executor.uid, 'images': [], 'commands': [], 'servers': [], 'cases': [], 'passed': False}
         self.entry_options = ([] if machine_entry is None else
                               ['--env', 'SHROOT_MACHINE_ENTRY=' + ('1' if machine_entry else '0')])
         self.report['kernelProfile'] = self.kernel_profile.evidence
@@ -149,34 +160,34 @@ class Suite:
         if machine_entry:
             self.entry_options.append('--statistics')
             self.report['machineEntry'] = {'processes': [], 'completed': 0}
-        self.console = self.client.call('console.open', {'directory': '/data/local/tmp'})['sessionId']
+        self.console = self.executor.console
         self.report['consoleId'] = self.console
         self.runner = None
         self.image = None
         try:
-            self.command(['mkdir', self.base])
             if session is not None:
                 assert build is None, 'Use the retained session build, not a second runtime'
                 self.runner = session['runner']
-                self.image = (session['directory'] + '/libmagicdesk_guest_image.so'
-                              if session.get('nativeBuild') else None)
+                self.image = session.get('image') or (session['directory'] + '/libmagicdesk_guest_image.so'
+                                                     if session.get('nativeBuild') else None)
                 self.report.update(session=session['id'], nativeBuild=session.get('nativeBuild'),
                     nativeHashes=session.get('nativeHashes'), entryMode=session.get('entryMode', 'default'))
                 self.kernel_profile.bind_session(
                     lambda argv: self.command(argv, quiet=True, raw=True), session)
             elif build:
                 hashes = self.stage_runtime(build, self.base)
-                self.runner = self.base + '/libmagicdesk_guest_run.so'
-                self.image = self.base + '/libmagicdesk_guest_image.so'
+                self.runner = self.executor.native_path(self.base + '/libmagicdesk_guest_run.so')
+                self.image = self.executor.native_path(self.base + '/libmagicdesk_guest_image.so')
                 self.report['nativeBuild'] = str(build)
                 self.report['nativeHashes'] = hashes
                 self.kernel_profile.prepare(lambda argv: self.command(argv, quiet=True),
-                                            self.base + '/libmagicdesk_guest_supervisor.so')
-                self.runner = self.kernel_profile.stage_launcher(
-                    lambda source, target: self.transport.upload(self.client, source, target),
-                    lambda argv: self.command(argv, quiet=True), self.runner)
+                    self.executor.native_path(self.base + '/libmagicdesk_guest_supervisor.so'))
             else:
-                self.runner = self.command(['/system/bin/sh', '-c', 'command -v shroot']).strip()
+                self.runner = (self.executor.libraries + '/libmagicdesk_guest_run.so'
+                               if self.executor.mode == 'app' else
+                               self.command(['/system/bin/sh', '-c', 'command -v shroot']).strip())
+                if self.executor.mode == 'app':
+                    self.image = self.executor.libraries + '/libmagicdesk_guest_image.so'
         except Exception as error:
             self.report['preparationFailure'] = repr(error)
             self.finish()
@@ -188,10 +199,10 @@ class Suite:
             filename = 'libmagicdesk_guest_' + target + '.so'
             with (build / filename).open('rb') as source:
                 hashes[filename] = hashlib.file_digest(source, 'sha256').hexdigest()
-            self.transport.upload(self.client, build / filename, directory + '/' + filename)
+            self.upload(build / filename, directory + '/' + filename)
             actual = self.command(['sha256sum', directory + '/' + filename], quiet=True).split()[0]
             assert actual == hashes[filename], (filename, actual, hashes[filename])
-            self.command(['chmod', '700', directory + '/' + filename])
+            self.chmod('700', directory + '/' + filename)
         return hashes
 
     def image_command(self, *args):
@@ -199,8 +210,9 @@ class Suite:
             args = (*args[:2], *self.kernel_profile.options, *args[2:])
         return [self.image, *args] if self.image else [self.runner, 'image', *args]
 
-    def installed_environment(self, name):
-        store = self.command(['shroot', 'path', name], quiet=True).strip()
+    def installed_environment(self, name, store=None):
+        if store is None:
+            store = self.command(['shroot', 'path', name], quiet=True).strip()
         # Cold admission belongs to the runtime under test, not to read-only
         # inspection by an APK which may carry an older schema revision.
         self.command(self.image_command('prepare', store), quiet=True)
@@ -214,11 +226,14 @@ class Suite:
                                      self.config['http_headers']['Authorization'].removeprefix('Bearer '),
                                      timeout=270, request_timeout=240)
 
-    def command(self, argv, quiet=False, timeout=180, expected=0, raw=False):
-        text = shlex.join(['timeout', '-k', '15', str(timeout), *map(str, argv)])
+    def observe(self, argv, quiet=False, timeout=180, raw=False):
+        argv = [self.executor.native_path(argv[0]), *argv[1:]]
+        text = shlex.join(['timeout', '-k', '15', str(timeout)])
+        # Built-in shell functions retain their selected identity and FPATH.
+        text += ' "$MAGICDESK_ANDROID_SHELL" -c ' + shlex.quote(shlex.join(list(map(str, argv))))
+        text = self.kernel_profile.shell(text)
         self.client.request_timeout = timeout + 30
-        result = self.client.call('console.execute', {'sessionId': self.console, 'command': text},
-                                  deadline=time.monotonic() + timeout + 30)
+        result = self.executor.execute(text, timeout + 15)
         self.report['commands'].append({'command': text, **result})
         self.record_entry(result['output'])
         if self.kernel_profile.options and not raw and '--test-kernel-profile' not in argv:
@@ -227,8 +242,28 @@ class Suite:
             self.kernel_profile.observe(result['output'], required=launching and result['exitCode'] == 0)
         if not quiet:
             print(result['output'], end='', flush=True)
-        assert result['exitCode'] == expected, result
-        return result['output'] if raw or '--test-kernel-profile' in argv else self.kernel_profile.output(result['output'])
+        if not raw and '--test-kernel-profile' not in argv:
+            result = {**result, 'output': self.kernel_profile.output(result['output'])}
+        return result
+
+    def command(self, argv, quiet=False, timeout=180, expected=0, raw=False):
+        result = self.observe(argv, quiet=quiet, timeout=timeout, raw=raw)
+        assert result['exitCode'] == expected, dict(exitCode=result['exitCode'],
+                                                  expected=expected, output=result['output'][-8192:])
+        return result['output']
+
+    def upload(self, source, target, **options):
+        return self.executor.upload(source, target, **options)
+
+    def native_capability(self, fixture, name):
+        return probe_native_capability(self.observe, self.report, fixture, name)
+
+    def download(self, source, target, **options):
+        return self.executor.download(source, target, **options)
+
+    def chmod(self, mode, *targets):
+        result = self.executor.chmod(mode, *targets)
+        assert result['exitCode'] == 0, result
 
     def prepare(self, name, layout):
         base = self.base + '/' + name
@@ -238,7 +273,7 @@ class Suite:
             with tarfile.open(archive, 'w') as stream:
                 for item in ('oci-layout', 'index.json', 'blobs'):
                     stream.add(layout / item, arcname=item)
-            self.transport.upload(self.client, archive, base + '/layout.tar')
+            self.upload(archive, base + '/layout.tar')
         self.command(['tar', '-xf', base + '/layout.tar', '-C', base + '/layout'])
         self.command(self.image_command('import', base + '/layout', base + '/image', '--preserve-ownership'))
         self.command(self.image_command('create', base + '/image', base + '/instance'))
@@ -254,6 +289,7 @@ class Suite:
                   'trap \'rm -f "$output"\' EXIT; "$@" >"$output"; status=$?; '
                   'printf "\\nSHROOT_TEST_STDOUT "; base64 "$output" | tr -d "\\n"; '
                   'printf "\\n"; exit "$status"')
+        argv = [self.executor.native_path(argv[0]), *argv[1:]]
         output = self.command(['/system/bin/sh', '-c', script, 'stdout', self.base, *argv], quiet=True)
         encoded, = [line.removeprefix('SHROOT_TEST_STDOUT ') for line in output.splitlines()
                     if line.startswith('SHROOT_TEST_STDOUT ')]
@@ -279,12 +315,13 @@ class Suite:
         coverage_error = None
         try:
             self.client.request_timeout = 30
-            self.client.call('console.close', {'sessionId': self.console})
+            self.executor.close()
         except Exception as error:
             self.report['passed'] = False
             self.report['cleanupFailure'] = repr(error)
             raise
         finally:
+            self.report['executor'] = self.executor.evidence
             evidence = self.report.get('machineEntry')
             if self.report['passed'] and evidence is not None:
                 if not evidence['completed']:
@@ -305,33 +342,48 @@ def port():
         return probe.getsockname()[1]
 
 
-def nginx(suite, store, controls=False):
+def nginx_workers(suite, store, controls, workers):
     number = port()
     config = f'''user nginx;
-worker_processes 1;
+worker_processes {workers};
 error_log {'stderr' if controls else '/dev/stderr'} info;
 pid /tmp/md-nginx.pid;
 events {{ worker_connections 32; }}
 http {{ access_log off; server {{ listen 127.0.0.1:{number}; root /usr/share/nginx/html; }} }}
 '''
     suite.command(suite.run(store, '--entrypoint', '/bin/sh', '--', '-ec',
-                            'printf %s "$1" > /tmp/md-nginx.conf', 'fixture', config))
-    server = Server(suite, suite.run(store, '--', 'nginx', '-c', '/tmp/md-nginx.conf', '-g', 'daemon off;'))
+                            'printf %s "$1" > /tmp/md-nginx.conf; '
+                            'rm -f /tmp/md-nginx-stop; mkfifo /tmp/md-nginx-stop', 'fixture', config))
+    # Keep shutdown in the server's supervised process tree. Another image run
+    # is an independent PID/signal domain even when it uses the same store.
+    server = Server(suite, suite.run(store, '--network', 'routed', '--', '/bin/sh', '-ec',
+        '/docker-entrypoint.sh nginx -c /tmp/md-nginx.conf -g "daemon off;" & master=$!; '
+        'read -r stop < /tmp/md-nginx-stop; '
+        'nginx -c /tmp/md-nginx.conf -s quit; wait "$master"'))
     try:
-        server.ready('start worker process')
-        client = http.client.HTTPConnection('127.0.0.1', number, timeout=10)
-        try:
-            client.request('GET', '/')
-            response = client.getresponse()
-            body = response.read()
-            assert response.status == 200 and b'Welcome to nginx!' in body, (response.status, body)
-        finally:
-            client.close()
-        suite.command(suite.run(store, '--entrypoint', 'nginx', '--', '-c', '/tmp/md-nginx.conf', '-s', 'quit'))
+        for _ in range(os.cpu_count() if workers == 'auto' else workers):
+            server.ready('start worker process ')
+        for _ in range(16):
+            client = http.client.HTTPConnection('127.0.0.1', number, timeout=10)
+            try:
+                client.request('GET', '/', headers={'Connection': 'close'})
+                response = client.getresponse()
+                body = response.read()
+                assert response.status == 200 and b'Welcome to nginx!' in body, (response.status, body)
+            finally:
+                client.close()
+        assert not any('fatal code' in line or 'epoll_ctl(' in line for line in server.log), server.log
+        suite.command(suite.run(store, '--entrypoint', '/bin/sh', '--', '-ec',
+                                'printf "quit\\n" > /tmp/md-nginx-stop'))
         server.completed()
     finally:
         server.close()
-    print('PASS nginx workers and HTTP response; logging control=' + str(controls), flush=True)
+    print(f'PASS nginx workers={workers} and HTTP response; logging control={controls}', flush=True)
+
+
+def nginx(suite, store, controls=False):
+    for workers in (1, 2, 'auto'):
+        nginx_workers(suite, store, controls, workers)
 
 
 def redis(suite, store, controls=False):
@@ -783,6 +835,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
     parser.add_argument('--build', type=Path, help='Explicit native build instead of installed APK helpers')
+    add_machine_entry_argument(parser)
     KernelProfile.add_argument(parser)
     parser.add_argument('--controls', action='store_true',
                         help='Explicit controls: nginx stderr directive and redis --user redis, not default-entrypoint passes')
@@ -792,7 +845,7 @@ def main():
         group.add_argument('--' + name + '-instance', help='Explicit disposable prepared instance on device')
     args = parser.parse_args()
     assert any(getattr(args, name) or getattr(args, name + '_instance') for name in NAMES)
-    suite = Suite(args.output, args.build, kernel_profile=args.kernel_profile)
+    suite = Suite(args.output, args.build, machine_entry=args.machine_entry, kernel_profile=args.kernel_profile)
     suite.report['controls'] = args.controls
     try:
         for name, test in (('nginx', nginx), ('redis', redis), ('postgres', postgres),

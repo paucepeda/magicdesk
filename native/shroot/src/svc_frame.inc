@@ -1,11 +1,14 @@
-.macro md_svc_slot reg
+.macro md_svc_slot reg,attempt=0
     mov \reg,sp
     eor \reg,\reg,\reg,lsr#16
     ubfx \reg,\reg,#8,#6
+    .if \attempt
+    eor \reg,\reg,#MD_SVC_SLOT_XOR(\attempt)
+    .endif
     movk \reg,#0,lsl#16
     movk \reg,#MD_SVC_POOL_HIGH,lsl#32
     movk \reg,#0,lsl#48
-    bfi \reg,\reg,#16,#6
+    bfi \reg,\reg,#MD_SVC_SLOT_SHIFT,#6
     and \reg,\reg,#0xffffffffffffffc0
 .endm
 .macro md_svc_gpr_pair paired,single,base,lo,hi,omit=-1

@@ -42,7 +42,8 @@ enum md_fs_xattr { MD_FS_XATTR_GET=1, MD_FS_XATTR_SET, MD_FS_XATTR_LIST, MD_FS_X
 static inline int md_fs_operation_value(unsigned operation) {
     return operation==MD_FS_XATTR || operation==MD_FS_FXATTR || operation==MD_FS_XATTR_OBJECT
         || operation==MD_FS_GETACL || operation==MD_FS_SETACL || operation==MD_FS_IPC_PEER
-        || operation==MD_FS_MOUNT || operation==MD_FS_FSCONFIG || operation==MD_FS_BPF || operation==MD_FS_LANDLOCK;
+        || operation==MD_FS_MOUNT || operation==MD_FS_OPEN_TREE || operation==MD_FS_FSCONFIG
+        || operation==MD_FS_BPF || operation==MD_FS_LANDLOCK;
 }
 enum { MD_FS_STAT_MOUNT = 1, MD_FS_STAT_CANONICAL = 2 };
 /* A proc magic-link description may name another mount tree. It is display
@@ -137,6 +138,9 @@ struct md_fs_result {
     struct md_fs_info info;
     unsigned selectors;
     unsigned requires_control;
+    /* Unexecuted context admission: capture the caller's native status handle. */
+    unsigned requires_task_status;
+    unsigned requires_task_capture;
 };
 /* Caller-owned output, independent of wire framing. Directory delivery runs
  * synchronously after the read transaction and before advancing the cursor.
@@ -165,5 +169,7 @@ struct md_fs_output {
     struct md_landlock_policy **landlock;
     /* Optional owned continuation, only with result.error == -EINPROGRESS. */
     struct md_fs_continuation **continuation;
+    /* This transport can capture a descriptor in the exact caller context. */
+    int task_capture;
 };
 #endif

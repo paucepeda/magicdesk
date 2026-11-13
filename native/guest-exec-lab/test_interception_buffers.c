@@ -194,7 +194,7 @@ static void filter_payload(void) {
     assert(!md_buffer_span(&filter,&span));
     assert(span.offset>=bytes && span.size>=sizeof(struct md_task_filter_image));
     struct md_task_filter_image *image=span.data;
-    struct md_fd_filter_gates gates={0x100000,0x200000,0x300000,0x400000};
+    struct md_fd_filter_gates gates={0x100000,0x200000,0x300000,0x400000,0x500000};
     for (unsigned kind=0;kind<MD_FD_SELECTOR_KINDS;++kind) {
         assert(!md_fd_filter_build(kind,123,&gates,&image->code));
         image->program=(struct sock_fprog){image->code.count,image->code.code};
@@ -433,9 +433,10 @@ static void native_memory_admission(void) {
     size_t page=(size_t)getpagesize(); uintptr_t base=0x4000000;
     struct md_interception_memory *m=md_memory_new(); assert(m);
     struct md_svc_registry *r=calloc(1,sizeof(*r)); assert(r);
+    r->capacity=2; r->sites=calloc(r->capacity,sizeof(*r->sites)); assert(r->sites);
     r->native_begin=base+300*page; r->native_end=r->native_begin+page;
     r->frames=base+400*page;
-    r->pool_count=1; r->pools[0].address=base+10000*page;
+    assert(!md_svc_registry_pool(r,base+10000*page));
     r->count=1; r->sites[0].direct.svc=base+4*page+128;
     r->sites[0].direct.gate=r->pools[0].address;
     assert(!md_memory_svc_set(m,r));
@@ -457,7 +458,7 @@ static void native_memory_admission(void) {
         .svc=base+8*page,.gate=r->pools[0].address+2048};
     md_memory_admission_publish(m,&p,1);
     assert(!md_memory_admission_allows(&p,base+8*page,page,page));
-    r->pools[r->pool_count++].address=base+20000*page;
+    assert(!md_svc_registry_pool(r,base+20000*page));
     md_memory_admission_publish(m,&p,1);
     assert(!md_memory_admission_allows(&p,base+20000*page,page,page));
     r->disabled=1;

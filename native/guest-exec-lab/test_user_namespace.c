@@ -4,11 +4,14 @@
 #include "proc_file.h"
 #include "guest_identity.h"
 #include "identity_snapshot.h"
+#include "identity_view.h"
 #include "sealed_manifest.h"
 #include "uts_namespace.h"
 #include "ipc_permissions.h"
 #include "fd_messages.h"
 #include "fd_filter.h"
+#include "task_registry.h"
+#include "task_resources.h"
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
@@ -17,9 +20,11 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -255,6 +260,30 @@ static void selectors(void) {
     assert(md_fd_selector_target(a,3,0)==-EINVAL);
     assert(md_fd_selector_target(a,3,4097)==-EINVAL);
     md_fd_selector_release(a); md_fd_selector_release(copy); md_fd_selector_release(shared);
+
+    struct md_fd_selector *required=md_fd_selector_new(),*installed=md_fd_selector_new();
+    assert(required && installed);
+    enum md_fd_selector_kind kind; int number;
+    assert(!md_fd_selector_missing(required,installed,&kind,&number));
+    const int descriptors[]={0,7,511,519};
+    for (unsigned k=0;k<MD_FD_SELECTOR_KINDS;++k)
+    for (unsigned i=0;i<sizeof(descriptors)/sizeof(*descriptors);++i) {
+        assert(md_fd_selector_has(required,k,descriptors[i])>=0);
+        assert(!md_fd_selector_mark(required,k,descriptors[i]));
+    }
+    unsigned count=0;
+    while (md_fd_selector_missing(required,installed,&kind,&number)==1) {
+        assert(!md_fd_selector_has(installed,kind,number));
+        assert(!md_fd_selector_installed(installed,kind,number,40));
+        assert(++count<=MD_FD_SELECTOR_KINDS*3);
+    }
+    assert(count==13); /* Four numbered kinds, one all-descriptor poll kind. */
+    assert(!md_fd_selector_mark(required,MD_FD_SELECTOR_PROC,-1));
+    assert(md_fd_selector_missing(required,installed,&kind,&number)==1);
+    assert(kind==MD_FD_SELECTOR_WATCH && number==-1);
+    assert(!md_fd_selector_installed(installed,MD_FD_SELECTOR_PROC,-1,40));
+    assert(!md_fd_selector_missing(required,installed,&kind,&number));
+    md_fd_selector_release(required); md_fd_selector_release(installed);
 }
 static void ordered_io(void) {
     struct md_identity id=md_identity_new(2000,2000);
@@ -409,7 +438,80 @@ static void proc_files(void) {
     md_proc_file_release(groups); md_user_namespace_release(child);
     md_identity_release(&stripped); md_identity_release(&parent);
 }
+static void process_backing(void) {
+    unsigned before=descriptors();
+    struct md_identity id=md_identity_new(1234,1235);
+    struct md_task_registry *tasks=md_task_registry_create(); assert(tasks);
+    struct md_task_resources resources={0};
+    assert(!md_task_registry_publish(tasks,getpid(),getpid(),&id,&resources));
+    const enum md_proc_file_kind kinds[]={MD_PROC_FILE_STATUS,MD_PROC_FILE_STAT,MD_PROC_FILE_LIMITS};
+    for (unsigned i=0;i<sizeof(kinds)/sizeof(*kinds);++i) {
+        char path[64]; snprintf(path,sizeof(path),"/proc/self/%s",md_proc_file_process_name(kinds[i]));
+        int fd=open(path,O_RDONLY|O_CLOEXEC); assert(fd>=0);
+        int dumpable=prctl(PR_GET_DUMPABLE); assert(dumpable>=0);
+        assert(!prctl(PR_SET_DUMPABLE,0));
+        struct stat direct,captured,native;
+        assert(!fstat(fd,&native));
+        struct md_proc_file_node a,b;
+        assert(!md_proc_file_task_stat(getpid(),&id,NULL,kinds[i],&a,&direct));
+        assert(!md_proc_file_task_fd_stat(fd,getpid(),&id,NULL,kinds[i],&b,&captured));
+        assert(a.device==b.device && a.inode==b.inode && a.process==b.process);
+        assert(direct.st_ino==captured.st_ino && direct.st_mode==captured.st_mode
+            && direct.st_uid==captured.st_uid && direct.st_gid==captured.st_gid);
+        struct md_proc_file *file=md_proc_file_open(NULL,kinds[i],&id,O_RDONLY); assert(file);
+        md_proc_file_node(file,(struct md_proc_file_node){.inode=b.inode+1,.device=b.device,.process=b.process});
+        assert(md_proc_file_backing(file,fd,&native,0)==-ESTALE);
+        md_proc_file_node(file,b);
+        assert(!md_proc_file_backing(file,fd,&native,0));
+        assert(md_proc_file_backing(file,fd,&native,0)==-EINVAL);
+        assert(lseek(fd,3,SEEK_SET)==3);
+        char text[16384];
+        long size=md_proc_file_read_at(file,NULL,NULL,text,sizeof(text),0); assert(size>0);
+        assert(lseek(fd,0,SEEK_CUR)==3);
+        close(fd);
+        assert(!prctl(PR_SET_DUMPABLE,1));
+        assert(!md_proc_file_retained_stat(file,tasks,0,&captured) && captured.st_ino==direct.st_ino);
+        assert(captured.st_uid==1234 && captured.st_gid==1235);
+        assert(!prctl(PR_SET_DUMPABLE,dumpable));
+        char prefix[17];
+        assert(md_proc_file_read_at(file,NULL,NULL,prefix,sizeof(prefix),1)==sizeof(prefix));
+        assert(!memcmp(prefix,text+1,sizeof(prefix)));
+        md_proc_file_release(file);
+    }
+    md_task_registry_destroy(tasks);
+    md_identity_release(&id);
+    assert(descriptors()==before);
+}
+static void process_directory_backing(void) {
+    unsigned before=descriptors();
+    struct md_identity id=md_identity_new(0,0);
+    for (unsigned path_only=0;path_only<2;++path_only) {
+        int flags=O_DIRECTORY|(path_only ? O_PATH : O_RDONLY);
+        int fd=open("/proc/self",flags|O_CLOEXEC); assert(fd>=0);
+        struct stat native,metadata; assert(!fstat(fd,&native)); metadata=native;
+        struct md_proc_file_node node;
+        md_proc_file_task_metadata(INT_MAX,&id,NULL,MD_PROC_FILE_PROCESS_DIRECTORY,&node,&metadata);
+        struct md_proc_file *file=md_proc_file_open(NULL,MD_PROC_FILE_PROCESS_DIRECTORY,&id,flags); assert(file);
+        md_proc_file_node(file,node);
+        assert(!md_proc_file_backing(file,fd,&native,1)); close(fd);
+        int published=md_proc_file_descriptor(file); assert(published>=0);
+        struct stat observed; assert(!fstat(published,&observed));
+        assert(observed.st_ino==native.st_ino && observed.st_dev==native.st_dev);
+        assert((fcntl(published,F_GETFL)&(O_PATH|O_ACCMODE))==(flags&(O_PATH|O_ACCMODE)));
+        assert(fcntl(published,F_GETFD)&FD_CLOEXEC);
+        int child=openat(published,"stat",O_RDONLY|O_CLOEXEC); assert(child>=0); close(child);
+        close(published);
+        struct md_control_opener opener={.identity=&id};
+        struct md_proc_file *copy=md_proc_file_reopen(file,&opener,flags); assert(copy);
+        md_proc_file_release(file);
+        published=md_proc_file_descriptor(copy); assert(published>=0); close(published);
+        md_proc_file_release(copy);
+    }
+    md_identity_release(&id);
+    assert(descriptors()==before);
+}
 void test_user_namespace(void) {
+    process_directory_backing();
     namespace_limits();
     resource_limits();
     credential_snapshot();
@@ -418,6 +520,7 @@ void test_user_namespace(void) {
     ordered_io();
     descriptor_lifetime();
     proc_files();
+    process_backing();
     const uint64_t caps=(UINT64_C(1)<<CAP_SETUID)|(UINT64_C(1)<<CAP_SETGID)|(UINT64_C(1)<<CAP_SETFCAP)
         |(UINT64_C(1)<<CAP_SYS_ADMIN);
     struct md_user_namespace *n=md_user_namespace_new(NULL,2000,2000,0); assert(n);
@@ -465,15 +568,26 @@ void test_user_namespace(void) {
     md_user_namespace_release(child); md_user_namespace_release(n);
 
     struct md_identity identity=md_identity_new(2000,2000);
+    struct md_identity_view view={0}; int64_t observed=-1;
+    md_identity_view_publish(&view,&identity);
+    assert(md_identity_view_read(&view,SYS_getuid,&observed) && observed==2000);
     assert(!md_identity_enter_user_namespace(&identity));
+    md_identity_view_publish(&view,&identity);
+    assert(!md_identity_view_read(&view,SYS_getuid,&observed));
+    assert(!md_identity_view_read(&view,SYS_getgid,&observed));
     n=identity.user_namespace;
     assert(md_identity_visible_id(&identity,0,identity.uid.real)==65534);
     assert(md_identity_capable(&identity,CAP_SYS_ADMIN));
     assert(!md_identity_capable_in(&identity,NULL,CAP_DAC_OVERRIDE));
     assert(md_identity_setuid(&identity,0)==-EINVAL);
     assert(!publish(n,0,n,2000,2000,identity.caps.effective,&uid,1));
+    md_identity_view_publish(&view,&identity);
+    assert(md_identity_view_read(&view,SYS_getuid,&observed) && observed==0);
+    assert(!md_identity_view_read(&view,SYS_getgid,&observed));
     assert(!md_user_namespace_setgroups(n,0));
     assert(!publish(n,1,n,2000,2000,identity.caps.effective,&gid,1));
+    md_identity_view_publish(&view,&identity);
+    assert(md_identity_view_read(&view,SYS_getgid,&observed) && observed==0);
     assert(md_identity_visible_id(&identity,0,identity.uid.real)==0);
     assert(md_identity_root(&identity)==2000);
     assert(!md_identity_setuid(&identity,0) && identity.uid.effective==2000);

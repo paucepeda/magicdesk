@@ -2,6 +2,13 @@
 #define MD_PID_CALLS_H
 #include "adapter_buffer.h"
 #include "fd_capture.h"
+#include <signal.h>
+#include <stdint.h>
+
+struct md_process_query { uint64_t value[2]; };
+union md_process_wait { siginfo_t info; int status; };
+long md_process_query(long number,const unsigned long *args);
+long md_process_wait_result(long number,const unsigned long *args);
 
 static inline long md_pid_visible(int native) {
 #ifdef MD_USE_LIBC
@@ -19,7 +26,7 @@ static inline long md_pid_native(int visible) {
 }
 long md_pid_signal_group(int selector,int signal);
 enum { MD_PIDFD_DONE=4 };
-struct md_pidfd_frame { struct md_fd_capture_frame capture; long result; int code; };
+struct md_pidfd_frame { struct md_fd_capture_frame capture; long result; siginfo_t info; };
 long md_pidfd_signal(const unsigned long *);
 long md_pidfd_namespace(const unsigned long *);
 long md_setns(const unsigned long *);

@@ -28,10 +28,12 @@ def main():
         name = ('sandbox-document-portal.sh' if args.case == 'portal' else
                 'graphical-session-cleanup.py' if args.case == 'session' else
                 'fuse-close.c' if args.case == 'close' else f'fuse-{args.case}.py')
-        suite.transport.upload(suite.client, fixtures / name, suite.base + '/fixture')
+        suite.upload(fixtures / name, suite.base + '/fixture')
         if args.case == 'close':
-            command = suite.run(args.store, '--bind-ro', suite.base, '/mnt',
-                '--user', '0:0', '--entrypoint', '/bin/sh', '--', '-ec',
+            launch = suite.guest if args.debug else suite.run
+            command = launch(args.store, *(['--diagnostics'] if args.debug else []),
+                '--bind-ro', suite.base, '/mnt',
+                '--user', '0:0', *(['--', '/bin/sh'] if args.debug else ['--entrypoint', '/bin/sh', '--']), '-ec',
                 'work=$(mktemp -d /tmp/md-fuse-close-build.XXXXXXXX); '
                 'trap \'rm -rf "$work"\' EXIT; '
                 'cc -x c -Wall -Wextra -Werror -O2 -pthread /mnt/fixture -o "$work/close"; '
@@ -45,7 +47,7 @@ def main():
                 '/usr/bin/python3 /mnt/fixture child' if args.case == 'session' else
                 shlex.join(['/bin/sh', '/mnt/fixture', args.portal_app, args.portal_backend])],
                 text=True, timeout=30))
-            suite.transport.upload(suite.client, session, suite.base + '/session')
+            suite.upload(session, suite.base + '/session')
             command = suite.guest(args.store, '--bind-ro', suite.base, '/mnt',
                        '--user', args.portal_user,
                        '--env', 'HOME=' + args.portal_home, '--env', 'PATH=/usr/bin:/bin',

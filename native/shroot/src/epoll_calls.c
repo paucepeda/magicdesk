@@ -11,6 +11,7 @@ long md_epoll_call(long nr,const unsigned long *a) {
     long memory=md_adapter_buffer_take();
     if (memory<0) return memory;
     struct md_epoll_frame *f=(void *)memory;
+    struct md_epoll_park parked;
     memset(f,0,sizeof(*f));
     long result=0;
     if (nr==SYS_epoll_ctl) {
@@ -33,29 +34,39 @@ long md_epoll_call(long nr,const unsigned long *a) {
         }
     }
     if (!result) result=md_guest_buffer_control(MD_BUFFER_EPOLL_BEGIN,0,0);
-    if (result>0 && result!=MD_EPOLL_NATIVE && result!=MD_EPOLL_CAPTURED) {
-        int fd=(int)a[0];
+    if (result>0 && result!=MD_EPOLL_NATIVE && result!=MD_EPOLL_CAPTURED && result!=MD_EPOLL_DONE) {
+        int fd=(int)a[nr==SYS_epoll_ctl ? 2 : 0];
         const struct md_descriptor_capture_protocol p={MD_FS_BUFFER_EPOLL_ADMIT,MD_BUFFER_EPOLL_CAPTURE_READY,
             MD_BUFFER_EPOLL_CAPTURE_SENT,MD_BUFFER_EPOLL_CAPTURE_OBSERVED,MD_EPOLL_CAPTURED,
             f->admission.number ? &f->admission : NULL};
         result=md_descriptor_capture_inputs(result,&f->capture,&fd,1,&p);
     }
-    while (result==MD_EPOLL_CAPTURED || result==MD_EPOLL_LOAN) {
+    while (result==MD_EPOLL_CAPTURED || result==MD_EPOLL_LOAN || result==MD_EPOLL_PARK || result==MD_EPOLL_COPY) {
         if (result==MD_EPOLL_LOAN) {
             result=f->admission.number ? md_guest_buffer_replay(&f->admission)
                 : md_guest_buffer_admit(MD_FS_BUFFER_EPOLL_LOAN);
             if (result<0) break;
         }
-        struct md_adapter_input reply=md_guest_buffer_start(MD_BUFFER_EPOLL_WAIT,0,0);
+        int park=result==MD_EPOLL_PARK;
+        int copying=result==MD_EPOLL_COPY;
+        long copied=0;
+        if (copying) {
+            size_t size=(size_t)f->copy_count*sizeof(*f->events);
+            void *output=(void *)(a[1]+(size_t)f->copy_offset*sizeof(*f->events));
+            copied=f->copy_read ? md_read_memory(f->task_events,output,size)
+                : md_write_memory(output,f->events,size);
+        }
+        if (park) parked=f->park;
+        struct md_adapter_input reply=md_guest_buffer_start(MD_BUFFER_EPOLL_WAIT,
+            park ? (uintptr_t)&parked : (uintptr_t)copied,park ? MD_EPOLL_PARK : copying ? MD_EPOLL_COPY : 0);
         result=reply.value;
         f=reply.buffer;
     }
+    if (result==MD_EPOLL_DONE) result=f->result;
     if (result>0 && result!=MD_EPOLL_NATIVE && nr!=SYS_epoll_ctl) {
         if (result>f->capacity) result=-EPROTO;
         else if (!f->native_output
                 && md_write_memory((void *)a[1],f->events,(size_t)result*sizeof(*f->events))) result=-EFAULT;
     }
-    long released=md_adapter_buffer_release();
-    if (result==MD_EPOLL_NATIVE) return released ? released : MD_CALL_NATIVE;
-    return result ? result : released;
+    return md_adapter_buffer_finish(0,result==MD_EPOLL_NATIVE ? MD_CALL_NATIVE : result);
 }

@@ -7,6 +7,7 @@
 #include <linux/seccomp.h>
 #include <sys/syscall.h>
 #include "syscall_catalog.h"
+#include "cooperative_entry.h"
 #define MD_BROKER_CASE(n) case SYS_##n:
 static inline int md_broker_filesystem_call(int nr) {
     switch (nr) { MD_FS_NOTIFICATION_CALLS(MD_BROKER_CASE) return 1; default: return 0; }
@@ -26,9 +27,27 @@ struct md_broker_completion {
 struct md_namespace_broker;
 enum { MD_BROKER_READ=1, MD_BROKER_OPEN=2, MD_BROKER_COOPERATIVE=4, MD_BROKER_DISCOVERY=8 };
 struct md_entry_channel;
-/* Mapping lifetime belongs to the stopped task. Forget precedes its release. */
+/* Mapping lifetime belongs to the supervisor's stopped task. Only that owner
+ * binds/forgets mappings; forget precedes release. Entry callbacks may forget
+ * other tasks, but must not reenter control dispatch. */
 int md_broker_cooperative_bind(struct md_namespace_broker *,pid_t,struct md_entry_channel *,uintptr_t wake_gate);
 void md_broker_cooperative_revoke(struct md_namespace_broker *,pid_t);
+/* Supervisor-side control admission; the existing operation owner publishes
+ * its eventual response. No guest register snapshot or kernel stop is implied. */
+void md_broker_entry_handler(struct md_namespace_broker *,void (*)(pid_t,struct md_entry_channel *));
+/* Optional native supervisor wake endpoint, published before any binding. */
+void md_broker_entry_target(struct md_namespace_broker *,pid_t);
+/* Supervisor-thread hint only. Validates the current task/channel request;
+ * stale hints cannot resume a stopped task or execute an old packet. */
+void md_broker_entry_wake(struct md_namespace_broker *,pid_t);
+/* Bounded supervisor-owned control dispatch. Returns progress or pending work;
+ * revisit resource owners before sleeping when nonzero. Worker IO stays independent. */
+int md_broker_entry_progress(struct md_namespace_broker *);
+void md_broker_entry_reply(struct md_namespace_broker *,struct md_entry_channel *,enum md_entry_outcome,long);
+void md_broker_entry_wait(struct md_entry_channel *);
+/* Publish one journaled caller action. The control owner retains its resource
+ * turns until MD_ENTRY_EFFECT_DONE; the worker never retires it as an FD call. */
+void md_broker_entry_effect(struct md_namespace_broker *,struct md_entry_channel *,long,const uint64_t [6]);
 struct md_namespace_broker *md_broker_create(struct md_fs_worker *, int statistics,
         void (*delegate)(const struct seccomp_notif *));
 void md_broker_listen(struct md_namespace_broker *, int listener);
@@ -58,28 +77,37 @@ struct md_broker_retirement {
     void *context;
 };
 void md_broker_retirement_handler(struct md_namespace_broker *,int (*)(const struct md_broker_retirement *));
-/* A cold cleanup action borrows a broker-held stop without delivering its
- * signal/lifecycle continuation. Its injected stops bypass normal admission;
- * take_event retains the original stop until native_return after restoration. */
+/* A cold cleanup action borrows only a syscall or synthetic interrupt stop.
+ * Signals, group stops and births must reach their normal dispatcher first;
+ * register restoration cannot recreate their kernel delivery context.
+ * take_event retains the borrowed stop until native_return after restoration. */
 int md_broker_native_borrow(struct md_namespace_broker *,pid_t,int *stopped);
 void md_broker_native_return(struct md_namespace_broker *,pid_t);
 /* Retain a real kernel event while its admitted worker operation retires.
  * No synchronous worker wait or filesystem IO occurs on the supervisor. */
 int md_broker_hold_event(struct md_namespace_broker *,pid_t,int,const struct rusage *);
+/* A barrier owns an undecoded stop. Revoke local leases and pause admission,
+ * but retain the native journal: entry registers are not syscall results. */
+void md_broker_park(struct md_namespace_broker *,pid_t);
 pid_t md_broker_take_event(struct md_namespace_broker *,int *,struct rusage *);
 /* Includes terminal events already reaped from the kernel but still owned by
  * worker retirement. ECHILD does not finish the dispatcher while these remain. */
 int md_broker_pending_events(struct md_namespace_broker *);
-/* Publish before resuming a tracee; forget retires its eligibility. */
-struct md_broker_code_ranges { uintptr_t starts[8]; size_t size; unsigned count; };
+/* Eligibility publication and kernel resumption are distinct. Only resuming=1
+ * releases the recorded stop; a context update must not resume a held event. */
+struct md_svc_registry;
 int md_broker_task(struct md_namespace_broker *, int pid, int eligible, uintptr_t raw_gate, uintptr_t watch_gate,
-    const struct md_broker_code_ranges *);
-/* A barrier restored an unchanged continuation after its synthetic stop.
+    const struct md_svc_registry *,int resuming);
+/* Stopped-task authority: a pure mask query needs no logical translation.
+ * Revoked before resuming with a different logical mask or debugger policy. */
+void md_broker_signal_query(struct md_namespace_broker *,pid_t,int native);
+/* A barrier or checkpoint decoder restored an unchanged continuation.
  * Retain eligibility and resource ownership; wake a request published before
  * this acknowledgement. Never use for an injected helper or held real event. */
 void md_broker_resumed(struct md_namespace_broker *,pid_t);
 /* A suspended code site needs a fresh observed call after signal recovery.
- * This only invalidates cold discovery sampling; it does not install code. */
+ * Zero invalidates all sites after a policy fence. This only invalidates cold
+ * discovery sampling; it does not install code. */
 void md_broker_resample(struct md_namespace_broker *,pid_t,uintptr_t instruction_pointer);
 void md_broker_forget(struct md_namespace_broker *, int pid);
 /* Bounded cold diagnostic; never waits for a worker-held lock. */

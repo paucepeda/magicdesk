@@ -9,7 +9,7 @@
 #include "file_open.h"
 #include "directory_record.h"
 
-/* Experimental inode namespace, not a syscall adapter. Each connection
+/* Persistent inode namespace, not a syscall adapter. Each connection
  * belongs to one worker; never use it from SIGSYS, a signal handler, or after fork.
  * Errors are negative errno. Store operations serialize before their transaction.
  * EAGAIN still reports an external SQLite writer bypassing that gate; no replay.
@@ -83,6 +83,9 @@ int md_inode_store_seal(struct md_inode_store *);
  * and immutable image sealing. Persistent stores deny new write authority but
  * do not revoke writable native OFDs/mappings. Negative errno on unavailable IO. */
 int md_inode_store_readonly(struct md_inode_store *);
+/* Read another retained projection's policy through this catalogue connection,
+ * without opening a writer for it. Foreign catalogues return EXDEV. */
+int md_inode_store_scope_readonly(struct md_inode_store *, const struct md_inode_lifetime *);
 int md_inode_store_reconfigure(struct md_inode_store *, int readonly);
 /* Prepare store-owned runtime resources before accepting guest operations.
  * Existing directories retain their owners and permissions. */

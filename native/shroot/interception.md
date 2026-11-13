@@ -22,18 +22,27 @@ exec republishes the same immutable bundle's ABI. No generated address header,
 Java class name or environment-variable switch selects an implementation.
 The bootstrap also publishes the internal [cooperative entry](cooperative-entry.md)
 used by lazy SVC rewriting in unmodified programs. It reuses the same worker and
-execution context. Unsupported sites and application-filtered execution retain
-Base admission.
-The dispatch gate receives policy and the retained typed-descriptor kind in x9
-and moves them to the C argument register in userspace. Descriptor classification
+execution context. Unsupported sites and calls without admitted application
+policy retain Base admission. Compatible filtered calls can use the cooperative
+entry with their original number, arguments and instruction pointer.
+The task-affine C executor and operation retirement are separate from register
+encoding and resumption. Admitted calls enter this executor through the shared
+channel; its internal buffer, descriptor and IPC controls retain their existing
+supervisor owners. Native actions have an acknowledged completion, and a required
+kernel continuation retains the pending operation rather than replaying it;
+see [execution and transport](cooperative-entry.md#execution-and-transport).
+The stopped-task dispatch gate builds the same `md_guest_execution` record as
+resident entry, on its already owned private stack. Its machine boundary carries
+policy in x9, retained typed-descriptor kind in w10 and prepared input in x11;
+the C executor receives only a pointer to the record. Descriptor classification
 belongs to the supervisor's ordered OFD capture; the adapter does not ask for
 the same classification again or cache guest FD numbers. It does not rely on
 changing x7 at an ARM64 syscall stop: the
 [kernel restores that register](https://github.com/torvalds/linux/blob/v5.15/arch/arm64/kernel/ptrace.c#L1694-L1726)
 after the stop. Notification cancellation, ordinary
 seccomp entry and debugger syscall stepping share this entry contract.
-For recvmsg, poll and managed exec adapters, x10 can carry an already leased input-buffer
-address. The assembly gate passes it as the ninth C argument. Missing mappings,
+For recvmsg, poll and managed exec adapters, the record can carry an already
+leased input-buffer address. Missing mappings,
 pool pressure and unsupported calls retain ordinary TAKE admission; this is not
 a per-thread buffer cache. Completion releases even an unclaimed lease after
 early argument failure. Exec keeps that lease through preparation until kernel
@@ -68,9 +77,8 @@ releases the leases; nonleader exec transfers them to the resulting task identit
 Program publication also prepares logical exec credentials from that same retained
 image. The final entry checkpoint registers actual mappings from those retained
 backings, commits credentials, updates both live and proc-snapshot auxv, and
-enters the loader. Secure entry first
-returns to the bootstrap to lower native dumpability, then completes at the same
-checkpoint. Ordinary entry needs no separate image-admission or entry notification;
+enters the loader. Secure entry publishes logical dumpability at the same
+checkpoint. Neither entry needs a separate image-admission or entry notification;
 atomic descriptor publication, noexec, set-ID and application-filter checks remain.
 Queued cancellation and task death also retire in-progress worker resources,
 without leaving temporary image FDs in a surviving CLONE_FILES peer.
@@ -86,6 +94,25 @@ against a supervisor descriptor or the native bootstrap image.
 
 ### Native IO And Selectors
 
+Adapted socket effects use a distinct native wait gate. It restores the caller's
+signal mask only around the kernel operation and shields the adapter again at
+the syscall exit, before address translation or accepted-FD publication resumes.
+Interrupted calls unwind through the common original-syscall restart boundary;
+kernel `EINTR`, receive timeouts and `SA_RESTART` remain authoritative. Internal
+IPC does not use this gate. Unadapted payload IO keeps its original native path.
+`MSG_DONTWAIT` operations also retain the short native path: their argument
+flags prove that no socket wait is needed, without querying descriptor state.
+`accept4`'s `SOCK_NONBLOCK` does not prove that its listening socket is nonblocking.
+An already admitted socket wait remains in the kernel across TSYNC. Its owned
+exit stop holds completion until policy publication; the pending call is not
+cancelled and re-admitted against the new filter.
+
+Supervisor-owned blocking IO uses `ipc_io_job` for completion and cancellation.
+A readiness or quiescence wake only requests resampling: collection leaves an
+unfinished job pending and never joins its blocking syscall. Atomic completion
+publication precedes retirement; cancellation interrupts the operation before
+joining. Both paths retain buffers and received-FD custody until the worker exits.
+
 Data IO, common memory operations, futexes, clocks and signals pass directly to
 the kernel. `MD_DOMAIN_KERNEL_CALLS` and `MD_DOMAIN_KERNEL_ARGUMENTS` describe
 additional calls requiring no adaptation or observation in any guest domain.
@@ -95,7 +122,10 @@ predicates compare the full 64-bit value; other commands retain the dispatcher.
 descriptor mutations whose origins need ordered observation. Their fcntl command
 is normalized to the kernel's 32-bit argument. Close, dup/dup3, close_range and
 F_SETFD/F_DUPFD/F_DUPFD_CLOEXEC complete in the kernel; the supervisor publishes
-metadata at the syscall-exit event. These capabilities remain available after
+metadata from the shared native-effect receipt or Base syscall-exit event.
+Ordered memory effects use the same completion owner for mapping provenance
+and SysV detachments, with refreshed fast-path exclusions before guest return.
+These capabilities remain available after
 the admitted proc-root restriction, with application filters still in force.
 An ordinary unfiltered close with an immediately available table turn obtains
 its low-int FD directly from a tagged seccomp event cookie. It needs no entry
@@ -104,26 +134,46 @@ The turn still spans the native exit:
 shared-table reuse, EBADF, late IO errors and terminal abandonment retain their
 existing semantics. Numbers above 32767, loans, contention and debugger/filter
 paths use full capture. This encoding is not an FD limit or a kernel permission.
-Application filters still evaluate kernel-fast-path calls. Logical credentials,
+Application filters still evaluate original-site kernel-fast-path calls. Admitted
+lazy entry evaluates the original call in the shared interpreter instead.
+Logical credentials,
 root changes, filter installation and dumpability changes retain their observers.
 Watch descriptors install bounded FD-class read selectors lazily; reads in
 unselected classes stay native until an application installs its own filter.
 Before that irreversible boundary, a single group-wide selector covers future
 typed descriptors without later seccomp calls. The application filter itself
-is replayed unchanged and retains all denials. Kernel-object identity distinguishes watch
+retains its application-site denials. Kernel-object identity distinguishes watch
 readers from ordinary descriptors sharing a class. Selected reads retain their
 original signal context while the worker waits for records; protected readers
 use task-affine copying and a native readiness wait. Filter installation ownership is separate from
 address-space and descriptor ownership; see [filesystem watches](watches.md).
-With the all-FD selector active, ordinary regular-file read/write and vectored
-or positional IO can resume directly from `PTRACE_GET_SYSCALL_INFO`. The syscall
-number and arguments come from the kernel, not the filter cookie. Admission
-requires a running file-table turn, a sole stopped table owner and an explicit
-ordinary regular-file origin. Unknown, typed, provisional and uncertain FDs,
-shared tables and debugger execution retain the full route. No registers,
-arguments, instruction address or application filter are rewritten; the table
-turn ends before potentially blocking IO. This removes redundant capture and
-watch-adapter stops, not the seccomp stop itself. Unselected native IO is unchanged.
+When a `vfork` child shares the file table, its kernel-suspended parent records
+bounded missing selector classes rather than blocking the child's publication.
+The parent installs those selectors at its clone-exit boundary, before returning
+to application code. Other runnable table holders retain ordinary admission.
+PID-sensitive selectors use the same task-affine filter executor and are installed
+once per group when PID namespace operations require them. Joining an unrelated
+namespace does not add a PID filter. Service waits and filter installation use
+owned task gates; a guest's direct forbidden syscall still receives its selected
+seccomp denial.
+Preflight releases its memory turn before replaying the application syscall.
+A prepared replay at a published lazy-SVC site uses its native alias, retaining
+the original policy identity and continuation without recursively entering the
+payload. Clone preparation and metadata replay use the same registry lookup.
+Signals may run at that boundary, including handlers that install another
+filter; the next entry reacquires ownership and captures the current arguments.
+With the all-FD selector active, ordinary regular-file and anonymous-pipe IO use
+one classifier for Base and resident entry. Base reads the real number and
+arguments from `PTRACE_GET_SYSCALL_INFO`, not the filter cookie; resident entry
+supplies its admitted logical call. Admission requires a running file-table
+turn, sole task ownership and explicit native-data provenance. Unknown,
+provider-backed, provisional and uncertain FDs, shared tables and debugger
+execution retain their owners. The table turn ends before potentially blocking
+IO. Base resumes the untouched kernel call; under an application filter its
+blocking continuation retains an exit observer so TSYNC does not interrupt and
+re-admit the operation under a newer policy. Resident entry transfers it to the
+terminal native journal without another ptrace entry/exit. Unselected native IO
+and unfiltered Base IO are unchanged.
 Poll and pselect can similarly resume at their original syscall when an ordered
 table snapshot contains no potential readiness providers. A maintained provider
 count avoids scanning the FD table or copying the vector for this decision.
@@ -131,7 +181,7 @@ Mixed tables retain typed classification. The kernel validates pointers, limits,
 timeouts and masks; no table turn spans the blocking wait. Adapted poll copies
 its first vector chunk with BEGIN and uses supervisor monotonic timing, without
 injecting guest clock syscalls or querying foreign process limits on every poll.
-When mixed-table classification finds only native descriptors in the selected
+In Base, when mixed-table classification finds only native descriptors in the selected
 vector, it retires the input buffer and resumes the original wait directly;
 there is no output to copy or intermediate adapter acknowledgement.
 Short ppoll vectors can be classified directly from an ordered snapshot, without
@@ -151,15 +201,25 @@ limit for the independent native waits.
 An internal quiescence interrupt before the wait's SVC resumes the same entry
 under its signal shield; it is not a syscall result. Its service wake is consumed
 at that boundary, independently of subsequent application signals or FD eviction.
+Resident unmasked epoll/poll/select waits execute journaled native effects on
+their existing channel. Only real signals, cold descriptor admission and loan
+changes need a stopped context; ordinary wait entry and completion do not.
+Virtual epoll subscription changes reuse the shared owner once its transport is
+admitted. Repeated MOD/DEL/ADD do not promote merely to update a virtual interest.
+Ignored signal stops retain the original deadline and resample, in both Base and
+resident execution. Base keeps interrupted ownership through the delivery stop,
+so a syscall-exit stop cannot decide EINTR before the signal disposition is known.
 After an interrupted caller-context wait, its temporary signal mask remains
 kernel-owned through delivery. That task cannot lend its continuation to FD
 retirement or publish retained signal carriers until its next syscall entry.
 This one-entry observation preserves the signal frame without single-stepping,
 stopping peers or adding observation to successful waits and ordinary data IO.
-An unmasked, unfiltered native epoll_pwait can first probe at timeout zero in the
-caller. A ready result needs only native entry/exit; an empty result proceeds to
-the owned wait with its original deadline. Application filters, debugger stops
-and masked waits retain full admission. Pure native waits publish output directly
+An unmasked native epoll_pwait can first probe at timeout zero in the caller.
+An admitted application filter uses the shared native-effect journal, without
+ptrace entry/exit for the probe; its policy is evaluated against the original
+arguments before reducing the probe timeout. An empty result proceeds to the
+owned wait with its original deadline. Debugger stops, unadmitted policies and
+masked waits retain full kernel admission. Pure native waits publish output directly
 through the kernel, including its pointer validation and event consumption.
 Failed argument reads and unknown authorities retain normal adaptation.
 Adapted calls run on guarded scratch stacks leased by `interception_memory`, the
@@ -174,13 +234,18 @@ data IO does not allocate runtime bookkeeping.
 
 Cold stop-owning transactions share one admission check: entry revocation,
 private-memory repair, task-affine injection and guarded mapping cannot borrow
-each other's stopped tasks. The sole nesting exception is retirement of a
-mapping's own temporary FD inside that mapping's barrier. A competing `mprotect`
+each other's stopped tasks. A mapping's own temporary-FD retirement and repair's
+private executor preparation reuse their existing memory turn and writer barrier;
+they do not acquire competing stop owners. A competing `mprotect`
 exit is retained by the active owner, including one from an unrelated address
 space, and replayed with its original status and accounting after release.
 This defers that repair, not all work in the unrelated process. Ordinary events
-remain runnable. Dumpability revocation retains a cold stopped-task barrier
-while recovering resident contexts. Seccomp installation instead revokes entry
+remain runnable. Logical dumpability changes require no stopped-task barrier.
+Broker-held signal-delivery, group and birth stops are not native-injection
+boundaries. Their event owner publishes them before a caller can borrow a later
+syscall or synthetic interrupt stop: restoring registers cannot recreate the
+kernel's original signal-delivery context.
+Seccomp installation revokes entry
 and drains occupied private frames without interrupting native waits. New public
 adapter admissions wait until the installing task completes its kernel call;
 already started adapters continue to completion. This applies to Base as well
@@ -204,14 +269,30 @@ does not require an unrelated `gettid` permission or change ordinary data IO.
 Internal syscall-entry/exit stops are retained before checkpoint continuation;
 replayed and newly collected events use the same checkpoint driver. A barrier
 therefore cannot lose a stop to an internal syscall replay loop.
+An undecoded stop parks broker admission without completing its native journal.
+Only a normalized stop may recover that result: an entry PC is also a post-SVC
+address, but its registers still contain input arguments. Barrier release replays
+the retained event through decoding before handing it to operation retirement.
 A barrier release returns debugger-owned tasks through normal continuation
 admission: a shared kernel interrupt must publish the debugger's pending stop
 before resuming guest execution. Untraced releases retain direct continuation.
+The checkpoint owner records each actual successful kernel resume, including
+internally selected SYSEMU and intermediate syscall replay, and clears the
+coordinator's stopped state. Barrier release preserves that owner's retained
+stage; it must not reset decoding by treating an unchanged continuation as a
+new explicit syscall-step request. Without a retained stage, the exact saved
+resume mode applies.
 When a native task call borrows such a stop, the checkpoint owner suspends its
 decoder until the exact boundary has been restored. SYSEMU entries retain their
-kernel skip state: injection drains that skipped exit before executing the
+kernel skip state independently of register edits and stop-decoder ownership,
+including explicit caller-requested SYSEMU. Injection drains that skipped exit before executing the
 borrowed call, then reconstructs an emulated entry without replaying guest IO.
 Ordinary data IO retains its native path.
+Parked signal waits release scratch, memory and file-table turns and can lend
+their exact task boundary to protected proc inspection. Their existing decoder
+suspension remains owned by the wait. A service interrupt rechecks the wait with
+its original deadline; completed signal consumption and genuine application
+interruption retain their ordinary results.
 Deferred events retain their captured accounting across debugger attachment
 changes; replay neither queries it again nor inherits another event's values.
 For more than four members, kernel collection checks one round-robin TID on two
@@ -282,6 +363,17 @@ pause request, retaining the original syscall-exit event. Task-affine cleanup ca
 then finish; replay revalidates the mapping and resumes repair, without executing
 the guest syscall again. Once mapping mutation starts, this handoff is forbidden.
 
+Candidate mapping, advice and replacement run in the address space's retained
+private executor, shared with managed robust cleanup. The guest caller remains
+stopped. A late caller exit/exec cancels the transaction but does not destroy its
+executor: candidate cleanup and replacement rollback finish before the exact
+terminal event and accounting are replayed. Completion never restores a dead
+caller's registers or closes remembered guest descriptor numbers. The normal
+dispatcher continues serving unrelated address spaces during helper waits and
+bounded scan/copy steps. Supervisor-state tests cover terminal events at each
+MAP/COPY/ADVICE/REPLACE boundary; native retained-actor and private-memory suites
+cover executor lifetime and actual mapping operations in User and Shell.
+
 Protected descriptor metadata uses the filesystem worker's captured-request
 receipts, without a guest buffer or a second file-table turn. The request retains
 the exported descriptor and task context through completion or cancellation.
@@ -298,8 +390,9 @@ allocator and inherited mapping, preventing overlapping leases between parent
 and child. Exec creates an independent pool; outstanding workers retain old
 storage until completion. The pool has 32 page-rounded response slots, allocated
 only for namespace execution, not direct-rootfs launches.
-Eight separate persistent cooperative-channel slots cannot consume response or
-control capacity. They are leased lazily and returned on task retirement.
+Eight inline cooperative-channel slots and demand-mapped channel blocks cannot
+consume response or control capacity. They are leased lazily and returned on
+task retirement.
 `adapter_buffer` owns the lease controls, while `adapter_frame` defines the
 filesystem, SysV packet and shared-memory metadata views. Filesystem requests
 clear only their bounded header, not the entire payload capacity. SysV calls
@@ -308,6 +401,18 @@ Typed descriptor IO without an input payload acquires its buffer and begins the
 operation in one request. Buffer exhaustion retains no OFD turn; ordinary pool
 release resumes admission. Provider completion returns both the result and the
 leased address, including interrupted or failed IO that still needs cleanup.
+UTS queries, shared-memory status, SysV packet preparation and typed ioctl schemas use the same
+combined acquisition principle: their first owner request leases and fills the
+buffer. Pool exhaustion retains that request without starting the operation;
+failure after acquisition still returns the lease for ordinary cleanup. UTS
+mutations retain explicit input capture before their owner changes the namespace.
+An ioctl schema can publish a bounded immutable scalar for the retained object
+and command. The common adapter then copies it directly, with normal guest
+policy and pointer checks, instead of requesting a second owner execution.
+This is not a per-FD result cache. Mutable or revocable answers, asynchronous
+commands, indirect outputs and descriptor transfers retain their typed owners.
+TUN feature discovery uses this contract; input-device version queries do not,
+because device revocation can change their result.
 Typed descriptor IO combines its final copy acknowledgement, buffer release
 and syscall completion in one checkpoint. Intermediate pages retain the OFD turn
 and buffer; the last acknowledgement commits only confirmed bytes before releasing
@@ -315,7 +420,7 @@ the slot. Acknowledgement and cleanup errors retain their original precedence,
 including partial reads. Both terminal IO and ordinary adapter returns use the
 same completion owner for signal/debugger state, registers and scratch-stack
 retirement. This transport is shared by proc files, FUSE and other virtual devices.
-The same terminal FINISH control retires poll and scalar socket receives, avoiding
+The same terminal FINISH control retires poll, epoll, typed ioctls and scalar socket receives, avoiding
 a separate RELEASE followed by DONE. Only scalar TAKE may publish a checkpoint
 directly at syscall entry; full-context returns keep their post-syscall boundary.
 An inline recvmsg/recvmmsg error can complete at the receive owner when the adapter
@@ -328,9 +433,11 @@ and receives with heap-backed temporary storage retain their output/cleanup cont
 
 All guest filesystem operations, including opens/reopens and root changes, use this
 transport before admission when their inputs can be captured. The task-local
-path uses signal-neutral control checkpoints to lease, submit and release a slot after copying
-the result. No temporary guest FD, socket, mmap or pool allocation is needed per
-call. Each admitted request owns one host allocation, a pinned output slot and a
+path leases, submits and releases a slot through the shared control channel when
+available. Operations needing stopped kernel context retain signal-neutral
+checkpoints and the same completion owner. No temporary guest FD, socket, mmap
+or pool allocation is needed per call. Each admitted request owns one host
+allocation, a pinned output slot and a
 captured filesystem context. Requests copy both validated paths, scalar fields
 and attributes before submission; getcwd needs no pathname allocation. Input
 capture acquires the file-table turn before the CLONE_FS turn, retaining the
@@ -439,6 +546,12 @@ queued realtime signals.
 
 ### Typed Provider Reads
 
+Providers may explicitly mark asynchronous internal preparation as repeatable
+after signal delivery, including without SA_RESTART. Direct control calls and
+the common file-IO continuation honor the same contract. Accepted effects,
+partially transferred data and splice are not replayed. Ordinary native reads
+and writes do not enter this preparation path.
+
 Mapped watch reads use the same engine reservation as RPC. The supervisor offers
 the shared reply, then queues commit/rejection on the filesystem worker after the
 adapter acknowledges its copy. No file-table or filesystem turn is held while
@@ -448,10 +561,13 @@ context until worker completion, independently of task lifetime.
 Mapped directory reads prepare records without advancing their OFD. The same
 acknowledgement commits its next cookie or leaves its old position unchanged.
 `ofd_order` retains only active descriptions, matching aliases with native
-self-kcmp; a denied comparison is an explicit error, never a guessed identity.
+`F_DUPFD_QUERY`, or self-kcmp when no inherited seccomp filter can terminate the
+owner. Without safe exact comparison, it conservatively orders active operations
+on the same native inode. This is ordering, not fabricated descriptor identity:
+each operation retains its own captured FD and cursor.
 Broker, mapped and RPC directory read/seek operations share those turns. Ordinary
 synchronous reads allocate no entry when no asynchronous read is active.
-Independent opens remain independent even for the same inode. Queued operations
+With exact comparison, independent opens also retain separate queues. Queued operations
 retain their captured FD, not its possibly reused guest number. Cancellation
 before offering leaves the cursor untouched; after offering it commits the
 possibly copied batch. The worker holds no SQLite or file-table lock over user
@@ -485,6 +601,14 @@ uses the captured object, not a second lookup of the guest FD number.
 Metadata/readlink/suffix operations borrow the same original input. Foreign
 executable readlink uses the shared response mapping and existing process-access
 checks, without a guest-side file or read syscall.
+Authorized inspection of protected `/proc` tasks captures the native descriptor
+and metadata in the target's context when external observation is denied.
+Directory results retain that descriptor for relative opens; immutable path
+identity does not substitute for provider-owned permissions or live attributes.
+A provider-owned pending operation may lend its parked task to this capture.
+The task-call owner restores the original wait; entry, interruption and signal
+return transitions cannot be borrowed. This lets a FIFO opener be inspected
+before its peer opens the other end, without cancelling the FIFO operation.
 Mknod of regular files/FIFOs also keeps construction descriptors on the worker.
 Task-affine chdir/truncate lease a worker-owned target; the caller executes the
 final syscall without installing that descriptor. Kernel filesystem state and
@@ -619,10 +743,12 @@ uncaptured inputs and nofollow sources without a stable backing use SCM_RIGHTS.
 Protected or filtered opens and directory seeks retain the task-affine adapter
 and its no-replay contract.
 Filesystem transports order descriptor capture and publication with native
-table mutations. Adapter control uses immutable bootstrap SVC checkpoints owned
+table mutations. Adapter controls reuse the shared channel where possible;
+kernel-context controls use immutable bootstrap SVC checkpoints owned
 by `task_checkpoint`, not service BRKs or application SIGTRAP. Selective TRACE
-handles unfiltered markers; restricted service execution uses scoped SYSEMU to
-skip registered markers while real calls retain kernel filter admission.
+handles unfiltered or exact-image-admitted markers; service execution without
+that admission uses scoped SYSEMU to skip registered markers while real calls
+retain kernel filter admission.
 Small scalar recvmsg requests prepare their vectors before ordered socket capture,
 so capture and IO can complete in one exchange. When permitted, pidfd_getfd
 captures the exact caller's OFD under the file-table turn; it is released after
@@ -691,23 +817,39 @@ sampling are opt-in; there are no per-call logs. Engine counters cover direct,
 mapped and RPC execution; transport selection does not hide filesystem work.
 Operation times include kernel
 waiting and descheduling; nested filesystem/SQLite totals must not be added as
-independent CPU costs. Detailed `--diagnostics` is a separate mode; neither is
-enabled for ordinary launches or comparative timing runs.
+independent CPU costs. Detailed `--diagnostics` is a separate mode.
+`--diagnostics=signals` records guest faults, their instruction/stack context and
+abnormal task exits without tracing successful calls. A fault record alone is
+not a crash: an application handler may recover it. These modes are disabled
+for ordinary launches and comparative timing runs.
 
 Internal sendmsg/recvmsg at the immutable raw-syscall gate go directly to the
 kernel. These calls are already unconditional native operations in every guest
 domain; the domain policy and gate share the explicit list. External calls still
-enter their adapters. This removes redundant supervisor stops, not application
-filter evaluation: ERRNO, TRAP and KILL also apply to the internal transport.
+enter their adapters after guest-policy admission. When the entire installed
+chain admits the runtime image, owned service gates precede the guest-policy
+body in the kernel mirror. The internal transport does not repeat the original
+call's policy evaluation. Unproven inherited gates retain kernel admission;
+Android's inherited filters apply in either case.
 Internal fstat at the same gate reads native descriptor metadata directly; it
 does not request logical inode or set-ID metadata. Application fstat retains the
 namespace and image-catalogue path.
 
 The guest owns SIGSYS, signal masks and alternate stacks. Native clone and signal
-return retain their register/extension ABI. Application filters are not removed:
-ERRNO, TRAP and KILL retain kernel precedence over runtime TRACE/USER_NOTIF.
-Register changes and same-site replay are rechecked by the kernel. Cancellation,
+return retain their register/extension ABI. Guest ERRNO, TRAP and KILL decisions
+remain authoritative over runtime routing. Admitted lazy entry checks the
+original number, arguments and IP locally; cold and original-site fallback
+calls retain the kernel mirror. Register changes and same-site replay are
+rechecked at their original boundary. Cancellation,
 group stops, concurrent TSYNC and non-leader exec have dedicated fixtures.
+Retained asynchronous signals cannot mask a pending synchronous exception. The
+shared delivery owner admits that exception first and waits for its native
+signal-frame commit before publishing a carrier. This preserves the original
+syscall/fault context in both execution identities; ordinary syscalls and
+deliveries without that conflict acquire no additional commit stop.
+An interrupted signal-mask query retains the pre-shield application mask through
+original-site replay. Its result never exposes the temporary admission mask;
+ordinary unshielded queries keep their native broker continuation.
 
 ## Guest Kernel Interfaces
 
@@ -744,13 +886,48 @@ fork/exec and nested namespaces. They never enter Android's key service or claim
 successful keyring creation. Applications may choose their existing no-key-service
 path; applications requiring keys receive an explicit unavailable interface.
 Later application ERRNO and higher-priority TRAP/KILL policies remain effective.
-There is no syscall-specific supervisor work or persistent keyring allocation.
+If an inherited Android TRAP outranks that ERRNO, host-policy admission returns
+the same ENOSYS after evaluating guest policy. Executors without that trap keep
+the kernel-only path. No persistent keyring allocation is needed.
+
+`name_to_handle_at` and `open_by_handle_at` use the same ENOSYS admission.
+Guest inode identities have no exportable file-handle provider; passing these
+operations through would expose host filesystem handles outside the guest mount
+model. Callers retain their unsupported-interface fallback in both executors,
+including under inherited Android seccomp. Application filter decisions still
+take precedence.
+
+The legacy kernel-log `syslog` syscall also returns ENOSYS through this policy.
+It has no guest provider and must not read, clear or reconfigure Android's log.
+The existing guest-only `/dev/kmsg` journal remains available, with independent
+reader cursors and event-driven readiness. An application requiring the legacy
+API receives an explicit error, including when inherited Android seccomp would
+otherwise terminate it. This does not affect userspace syslog sockets.
+
+`io_uring_setup`, `io_uring_enter` and `io_uring_register` also return ENOSYS
+through that admission. Shroot has no asynchronous submission provider for guest
+paths, logical credentials or typed descriptors. Passing a native ring through
+would bypass those owners; reporting its absence lets applications select their
+ordinary syscall backend. This applies to both executors and does not intercept
+ordinary reads or writes. Guest seccomp decisions still take precedence.
+
+`quotactl` and `quotactl_fd` use the same ENOSYS admission: the guest filesystem
+has no per-user/group/project quota provider. Neither interface reads or changes
+Android backing-filesystem quotas. This is explicit absence, not successful
+quota enforcement; mount-wide tmpfs limits are independent. The shared
+`unavailable-calls` policy fixture checks every absent-provider syscall with
+plain, ALLOW, ERRNO, TRAP and KILL admission under both executors and entry modes.
+
+`statmount` and `listmount` likewise return ENOSYS until the guest mount provider
+implements their query ABI. They must not expose Android's mount namespace.
+Applications can use the existing guest `/proc/self/mountinfo` and mounts views;
+this is not an empty or partially fabricated mount list.
 
 ## Protected Metadata
 
 The supervisor first attempts kernel remote-memory/descriptor access. A
-nondumpable task can deny that access; the runtime never makes it dumpable to
-proceed. The task-affine fallback exports a retained descriptor through SCM_RIGHTS,
+host permission denial retains the task-affine fallback, which exports a
+retained descriptor through SCM_RIGHTS,
 uses notification ADDFD and resumes a bounded copy at the original call site.
 Instruction-only copy faults return EFAULT. Notification IDs are checked when
 replying; cancellation invalidates pending work rather than authorizing a replay.
@@ -781,7 +958,7 @@ on that admitted object. It does not chmod or replace the stored source.
 
 Initial launch and exec use the same admission contract. The supervisor tracks
 logical IDs, irreversible drops and no_new_privs, publishes auxv/AT_SECURE, and
-applies the corresponding nondumpable state before loader entry. Real kernel
+applies the corresponding logical dumpability before loader entry. Real kernel
 credentials remain those of the executor. Stored set-ID files need no explicit
 admission option. File-capability revisions 1-3 use the same owner and admission,
 including permitted/inheritable/bounding masks, effective and ambient transitions,
@@ -798,6 +975,31 @@ IDs and effective capabilities. Both honor scoped `CAP_SYS_PTRACE` and the
 target capability subset. Callers retain their namespace, restricted-root,
 dumpability and native-access checks; guest capabilities grant no Android
 process access.
+
+### Dumpability
+
+`process_access` owns guest dumpability for both app UID and UID 2000.
+`CLONE_VM` shares it; fork copies it; successful exec creates a new state.
+Ordinary exec restores 1, secure exec selects 0, and committed effective/filesystem
+ID changes or permitted-capability gains clear it. Invalid PR_SET_DUMPABLE values
+return EINVAL without changing state. Guest seccomp still admits both prctl calls.
+
+Native guest tasks remain dumpable so runtime memory access does not require
+protected-copy round trips. Logical inspection checks enforce guest dumpability
+alongside credentials for ptrace, process_vm, kcmp and proc views. Same-thread-group
+inspection and scoped CAP_SYS_PTRACE retain their existing exceptions. The
+voluntary `PTRACE_TRACEME` handshake checks parent/child capabilities separately;
+it does not require the child to be dumpable. The dumpability capability exception
+uses the address space's retained user namespace, not a namespace
+entered later by its credentials. Proc inode ownership uses the same state;
+public process directories retain their owner, while protected entries become
+owned by the address space namespace's root. Memory-view opens check inspection
+authority once; `stat`, `io`, `wchan`, `syscall` and `stack` use their existing
+typed read path for field suppression or read-time refusal. Ordinary file IO
+does not acquire another interception layer. This is
+guest ABI policy, not an Android process-isolation boundary or a core-dump service.
+The native component tests may still deliberately disable real dumpability to
+exercise host-denial fallbacks; guest tests exercise the virtual contract.
 
 `--user` and OCI User share `guest_accounts` resolution and `guest_identity` with
 image admission. Each task retains real/effective/saved/filesystem UID/GID and

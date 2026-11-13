@@ -9,6 +9,7 @@ Android Activities, named environments or launcher configuration.
 | Filesystem context | `CLONE_FS` | `CLONE_FS` | Retained |
 | Mount view | Shared independently of `CLONE_FS`; `CLONE_NEWNS` copies | `CLONE_NEWNS` copies and separates FS context | Retained |
 | Descriptor-origin annotations | `CLONE_FILES` | `CLONE_FILES`, `CLOSE_RANGE_UNSHARE` | Detach; remove close-on-exec entries |
+| Process inspection/dumpability | `CLONE_VM` shares; independent address spaces copy | Retained | New address-space owner, including after vfork |
 | Semaphore undo | `CLONE_SYSVSEM` | `CLONE_SYSVSEM` | Retained |
 | UTS names | Shared; `CLONE_NEWUTS` copies | `CLONE_NEWUTS` copies | Retained |
 | SysV IPC namespace | Shared; `CLONE_NEWIPC` creates an empty namespace | `CLONE_NEWIPC` creates an empty namespace and separates semaphore undo | Retained |
@@ -73,12 +74,21 @@ native argument, mask and disposition checks.
 
 ## Process Limits
 
+Guest ownership and host authority are independent. The selected executor never
+changes during a launch; native operations are used where its permissions and
+the guest resource's ownership allow them. A managed network's sysctls belong
+to that network even under Android root, while a native network retains Android's
+view. There are no separate UID-specific guest implementations.
+
 `process_limits` owns guest `RLIMIT_NPROC`, `RLIMIT_NOFILE` and real-UID/user-namespace task counters
 within one supervised launch. It reserves a charge before native clone, transfers
 it only to the confirmed child and releases it on failure or task disposal.
 Threads share the process limit; independent processes inherit a copy. Registry
 custody retains unreaped zombies. A quota-pressure check can release kernel-reaped
 charges without discarding identities still needed by a pending translated wait.
+Child-notification metadata has a separate lifetime: copied PID mappings and
+credentials survive reaping without retaining process-limit charges, task
+resources or namespace references. See [PID views](namespace-providers.md#pid-and-proc-views).
 Normal file/socket IO does not inspect counters or scan tasks.
 Cached accounting scopes use stable namespace identity values, including their
 generation, rather than owning namespace references. Keeping an accounting
@@ -115,6 +125,29 @@ physical task ceiling and real-time scheduling permissions remain native. A
 logical capability does not grant Android `CAP_SYS_NICE` or raise host hard limits.
 Coverage: `test_nproc.py` (NPROC and NOFILE, both entry modes), `test_process_limits`, packaged `test_rtkit.py`, and
 Fedora `test_os_boot.py --rtkit` with the original service sandbox.
+
+### OOM Policy
+
+`process_oom` serves `oom_score_adj` and the legacy `oom_adj` scale through the
+existing typed proc descriptors. Thread-group state shares the process-policy
+lifetime: threads share, independent forks copy, and exec retains it. Writes
+propagate across guest processes sharing an address space, excluding vfork's
+borrowed memory. Only these uncommon policy writes inspect the shared-mm peers;
+normal file IO and process creation acquire no additional allocation or scan.
+
+Guest DAC, readonly proc mounts, ranges and initial-user-namespace
+`CAP_SYS_RESOURCE` govern admission. Native writes are attempted until Android
+denies one with `EACCES` or `EPERM`; that process group then retains its guest
+value independently. Other native failures are not converted into success.
+This preserves usable native adjustment without requiring a particular UID,
+and lets container managers maintain their guest policy under a restricted
+executor. It does not grant protection from Android's OOM killer, implement
+guest memory quotas, or change Android's policy for unrelated processes.
+Unmanaged tasks and inherited native proc descriptors retain native behavior.
+
+`test_process_limits` covers the policy owner; `test_process_oom.py` exercises
+the mounted guest interface. The app-UID policy fixture includes shared-mm and
+vfork checks alongside cold credential calls and application-filter admission.
 
 ## Request Context
 
@@ -222,9 +255,13 @@ participant resumes guest execution. Nonleader exec transfers the executing
 thread's resources to its resulting process identity; teardown of the replaced
 leader must not release the executing thread's owners. Kernel exec detaches
 shared descriptor tables, but not shared filesystem context or semaphore undo.
-Exec prepares its detached annotation owner before the kernel call. The confirmed
-exec event commits that owner and removes close-on-exec entries before transferring
-the executing nonleader's resources. Failed exec does not change the owner.
+Exec prepares its detached annotation table and new process-inspection owner in
+one resource transaction before the kernel call. The confirmed exec event commits
+both and removes close-on-exec entries before transferring the executing nonleader's
+resources. Failed exec retains both original owners. A vfork child shares the
+parent's inspection state only until exec: later credential or dumpability changes
+belong to the new address space, not the parent's. Guest proc access and debugger
+admission use that same owner; native task dumpability remains runtime-owned.
 Fork copies annotations at its actual birth event and releases the turn before
 waiting for vfork completion. `close_range` with CLOSE_RANGE_UNSHARE uses the same
 prepare/commit/rollback transaction as `unshare(CLONE_FILES)`, then applies its

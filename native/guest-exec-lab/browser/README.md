@@ -6,7 +6,8 @@ Use a prepared disposable Debian or Alpine store with matching browsers, librari
 and helper fixtures, never a personal browser profile.
 
 The runtime supports application filters but is **not a complete security
-sandbox**. Real executor credentials remain UID 2000 in these tests. The
+sandbox**. `--executor shell|app` selects the real Android identity without
+changing guest assertions; the store must belong to that executor. The
 [interception contract](../../shroot/interception.md) defines ownership,
 logical image admission and remaining isolation limits.
 
@@ -21,6 +22,10 @@ sh native/guest-exec-lab/browser/build.sh build/guest-browser
 python native/guest-exec-lab/browser/run.py --build build/guest-browser --store DEVICE_GUEST_STORE --expect-artifact /tmp/NEW_FIREFOX_PROFILE/page.png -- /bin/sh -ec 'mkdir /tmp/NEW_FIREFOX_PROFILE; exec /usr/bin/firefox-esr --headless --no-remote --profile /tmp/NEW_FIREFOX_PROFILE --window-size 800,600 --screenshot /tmp/NEW_FIREFOX_PROFILE/page.png "data:text/html,<h1>MagicDesk guest browser</h1>"'
 python native/guest-exec-lab/browser/test_browser.py --build build/guest-browser --store DEVICE_GUEST_STORE
 ```
+
+Use `--software` for the same DOM, screenshot and sandbox checks without Turnip
+or a render node. It selects CPU rendering, not `--no-sandbox`. The app executor
+uses the fixture-enabled APK and verifies its helper hashes against `--build`.
 
 The full-browser fixture defaults to Debian's packaged helper at
 `/usr/lib/chromium/chrome-sandbox`; `--helper` selects another guest path. It must
@@ -97,10 +102,54 @@ output, application-filter denial, nondumpable fallback and native procfs reads.
 and nonempty Mojo startup independently of a displayed page. Prepared stores
 supply these explicitly; they are not downloaded by the runtime.
 
+## Video And Input Measurement
+
+`benchmark.py` runs the installed Chromium in headless software mode with its
+ordinary sandbox. It serves a supplied local WebM, waits for actual video frames,
+then alternates Base/lazy runs with fresh owned profiles. It requires the host
+Python `websocket-client` package. Root observes host thread CPU counters only;
+browser execution retains the selected executor and guest UID 2000.
+
+```sh
+python native/guest-exec-lab/browser/benchmark.py --build BUILD --store DEVICE_GUEST_STORE --executor app --video LOCAL_VIDEO.webm --output build/browser-video --seconds 45 --rounds 2
+```
+
+`--chromium` selects the installed ELF. Use `--executor shell` with a Shell-owned
+store for the same workload. Reports retain the video hash, browser version,
+supervisor/thread CPU deltas, CPU-frequency samples, host display state/mode
+before and after playback, video frame/drop counters,
+input receipts and screenshots. Input latency is the DevTools insertion and
+next-animation-frame round trip, not a physical-keyboard-to-display measurement.
+CPU percentages use one core as 100%; they exclude the browser's own processes.
+Display snapshots are read outside the timing interval and do not change refresh
+rate; they do not observe every intermediate mode change.
+Profiles and processes are removed after each run; images and reports remain.
+
+For a running `installed_desktop.py` graphical fixture, replace `--build` and
+`--store` with `--desktop-session PATH/session.json`. This uses its existing
+runtime, desktop user and stock Flatpak Chromium, without headless mode or a
+GPU-disable flag. `--flatpak` selects the application ID. The fixture creates
+its own DevTools target; internal browser pages are never selected implicitly.
+It records GPU configuration alongside the same video and input receipts.
+The caller owns the desktop lifetime and awake lease. Stop the retained fixture
+after measurement to collect its supervisor counters; browser stderr alone
+does not contain the shared desktop supervisor's statistics.
+
+Run `--statistics --modes lazy --rounds 1` separately to require measured
+post-filter completions. `--diagnostics` adds detailed runtime transitions.
+`--profile` records supervisor/worker CPU samples with root `simpleperf` only
+during playback, retaining the recording, sampling log and symbol report.
+Instrumented variants are not timing baselines. A few accelerated calls do
+not prove that video's hot path is accelerated. Do not overlap timing runs with
+builds or other tests. This fixture does not certify Wayland, hardware decoding,
+YouTube networking or desktop presentation. The retained-desktop variant tests
+that selected compositor and GPU configuration, not other devices or displays.
+
 ## Coverage And Limits
 
-Device coverage is NX809J, Android 16, Linux 6.12.23, 4 KiB pages, actual
-UID 2000 in the shell SELinux domain. Firefox's headless screenshot and
+Device coverage is NX809J, Android 16, Linux 6.12.23, 4 KiB pages. The shell
+executor runs as UID 2000; app-UID software Chromium coverage uses the real
+untrusted application domain. Firefox's headless screenshot and
 Chromium's three-profile JavaScript/PNG workflows establish execution, not
 arbitrary browsing, network/GPU compatibility or confinement.
 

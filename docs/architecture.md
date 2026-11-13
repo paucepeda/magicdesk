@@ -44,7 +44,7 @@ behavior, static verification and remaining device coverage.
   `GraphicalSessions` supplies shared manager and automation controls. Protocol
   owners retain their catalogs; `HostedWindowPresentation` owns Android placement
   reservations and replacement hosts for both protocols.
-- `ToolApplications` and `ToolLaunchTarget` select ordinary fullscreen Activity
+- `ToolApplications` and `ToolLaunchTarget` select ordinary Activity
   placement or the existing managed Desktop launch path. Phone control-panel
   tools do not acquire HOME or require Desktop provisioning. Background launches
   and privileged cross-display placement use the shell service; ordinary phone
@@ -59,6 +59,11 @@ behavior, static verification and remaining device coverage.
   a missing own task is distinct from one that needs privileged placement.
   The Android integration gateway uses the same placement selection for
   third-party Activities, content, shortcuts and notification actions.
+  Ordinary launches default to fullscreen. Explicit freeform uses the same
+  privileged Activity transport, with bounds and STANDARD activity type, without
+  acquiring HOME or Desktop. `PlatformWindowingDriver` owns firmware admission;
+  Nubia requires managed Desktop for its task/Recents recovery. The launcher
+  and automation share this policy, including retained-window placement.
 - `DisplayOperations` creates and lists display resources without starting
   Desktop. A viewer, an owned virtual display and a Desktop session have separate
   lifetimes. Removal still observes the existing session cleanup boundary.
@@ -80,6 +85,13 @@ behavior, static verification and remaining device coverage.
   independent tools and automation on an unsupported SDK.
 
 ## Design Principles
+
+Command execution selects **User**, **Shell** or **Termux** independently of
+terminal/graphics presentation and Linux storage. `CommandExecution` captures
+the actual UID, home and endpoint authority; retained sessions never switch
+executor on reconnect or failure. User and Shell share the native PTY/pipe
+protocol and managed Shroot storage. Shell remains named Shell when running
+with UID 0; root authority is not a request for a native-root guest engine.
 
 MagicDesk follows these constraints:
 
@@ -184,8 +196,9 @@ These constraints define the supported implementation paths:
   chords/system keys to a focused whole-Linux-desktop host. Ordinary typing and
   pointer motion retain Android dispatch. Power and volume keys remain Android's.
   Phone pointer injection is a separate virtual device, not physical relay.
-- Phone-screen-off process protection uses only the transient vendor
-  service-working heartbeat; no persistent freezer whitelist is installed.
+- Physical phone-panel control uses shared Android commands and a scoped CPU
+  wake lock. Optional process protection uses only transient vendor
+  service-working hints; no persistent freezer whitelist is installed.
 - ZTE audio source `80` is a `MediaRecorder` path. Replacing it with
   `AudioRecord` fails in AudioFlinger even for a privileged UserService.
 

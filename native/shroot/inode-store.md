@@ -54,6 +54,13 @@ concurrent database access; shareable backing custody remains a separate owner.
 The mounted-store LRU targets 16 connections, skipping active references. Nested
 scopes and in-flight births can temporarily exceed that target; pruning/cache
 misses trim idle excess. Cache capacity is not a guest `EMFILE` condition.
+Mount-table policy reads reuse an existing connection to the same catalogue
+across retained overlay scopes. They use the catalogue gate and current policy
+query, without opening an overlay writer or importing another mount's flags.
+Each export groups catalogue queries and reads a scope once for all bind aliases,
+then restores public mount order. Policy values live only for that snapshot;
+independent remounts are read afresh on the next export.
+They neither enlarge the IO cache nor add a separately invalidated policy cache.
 
 `inode_db.c` owns transactions, allocation, identities and metadata queries;
 `inode_schema.c` owns creation, format/revision admission, metadata upgrades,
@@ -99,12 +106,13 @@ unlink, including stale listeners; existing connections survive unlink/rebind.
 Format 17 is the compatibility baseline. SQLite `application_id=0x53485254`
 identifies Shroot, `user_version=17` identifies the storage family, and the
 `properties` row `schema-revision` identifies the metadata revision (initially 1,
-currently 4). Revision 2 adds native-publication intents and large directory-cookie
+currently 5). Revision 2 adds native-publication intents and large directory-cookie
 mappings. Revision 3 replaces fixed overlay-attribute slots with named logical
 xattrs, preserving existing overlay values and tombstones. Guest `trusted.*`
 attributes use the same inode identity and guest capability checks; they do not
 require Android trusted-xattr permissions. Revision 4 adds stable directory-entry
 identities for exact descriptor paths, backfilled from the existing namespace.
+Revision 5 admits store-relative shared-source paths; absolute rows remain readable.
 These revisions do not move installed
 data or change image import identity.
 Admission validates those markers before current-schema namespace queries or
@@ -149,6 +157,16 @@ revision with their metadata. Checkpoint and directory-sync errors propagate.
 This recovery contract is tested with process death and injected errors, not a
 claim of physical power-loss testing. Concurrent preparation reports busy instead
 of racing another owner. Current WAL/revision stores retain shared admission.
+
+Source paths are resolved once against the owning store at admission, then held
+as directory descriptors with the existing device/inode validation and leases.
+Snapshot copying and staged image publication rebase relative paths before commit.
+Offline library relocation refuses shared sources outside the physical library,
+including symlink escapes, and acquires the catalog and every source/store lifetime
+lease before converting references and renaming the complete tree. Partial
+conversion leaves the old location usable; an occupied destination is never
+replaced. This is a same-filesystem move, not a portable copy: backup/restore
+materializes shared bodies and reconstructs their physical identities elsewhere.
 
 Guest names, stable object IDs, ownership/ACLs, file-path ambiguity history,
 backing/source references, allocation inventory and namespace counters are
@@ -266,12 +284,12 @@ invalidating existing IO. Readonly mounts protect metadata, not device IO.
 
 ## Native Publication
 
-Eligible guest creation uses native leaves by default, without an experimental
-flag. The parent must be attached, local, have
+Eligible guest creation uses native leaves by default. The parent must be
+attached, local, have
 virtual permissions and no default ACL. The store probes user-xattr metadata on
 an unnamed temporary file during admission/reconnection; failure retains the
 catalogue allocator. Inspection does not probe or mutate. Trusted tree imports
-using physical permissions retain their previous allocation path; OCI metadata
+using physical permissions use the catalogue allocator; OCI metadata
 and directories created with guest credentials use virtual permissions.
 
 An eligible private regular leaf (logical UID/GID zero, owner-readable/writable,
@@ -729,6 +747,11 @@ independent of OCI parsing and launch-local directory attachments.
   also request explicit barriers. Data or checkpoint errors propagate; they are
   not converted into successful durability acknowledgements.
 - Detached objects and uncommitted allocations are retained and audited separately.
+  The native image helper's `maintain STORE` command collects unused projection
+  views and untracked physical allocations under the exclusive store lifetime
+  gate. A live owner causes EBUSY before any maintenance; ordinary `prepare`
+  and guest syscalls do not perform this scan. Shared source bodies and allocated
+  reserves remain referenced and are retained.
   There is no live garbage collector for ordinary detached objects. Removing metadata while another process
   holds an FD would break descriptor lookup. Long-lived stores can therefore
   accumulate unreachable backing data; live reclamation remains unsupported.

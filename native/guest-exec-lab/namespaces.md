@@ -371,12 +371,12 @@ account resolution, registry and inode contracts, plus `credentials_guest` for
 intercepted calls. The device runner accepts a prepared device-side OCI layout:
 
 ```sh
-python native/guest-exec-lab/test_credentials_runtime.py BUILD DEVICE_LAYOUT --packages debian
-python native/guest-exec-lab/test_credentials_runtime.py BUILD DEVICE_LAYOUT --packages alpine
+python native/guest-exec-lab/test_credentials_runtime.py BUILD LOCAL_LAYOUT --packages debian
+python native/guest-exec-lab/test_credentials_runtime.py BUILD LOCAL_LAYOUT --packages alpine
 ```
 
-The runner requires actual UID 2000 and creates its own preserved-ownership image
-and instance. It checks independent root/non-root launches, chmod/chown/access,
+The runner accepts `--executor app|shell` or `SHROOT_TEST_EXECUTOR` and creates
+its own preserved-ownership image and instance under that identity. It checks independent root/non-root launches, chmod/chown/access,
 hardlinks, group copying and EFAULT, nondumpable processes, per-thread raw IDs,
 libc set-ID coordination, fork/exec, auxv and irreversible credential drops.
 Signal checks run without a PID namespace: foreign launch/guardian targets are

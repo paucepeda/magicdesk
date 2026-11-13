@@ -12,11 +12,12 @@
 /* Runtime gates normally share one code mapping. Group their high words so
  * every persistent selector does not spend five instructions per gate. */
 static void exemptions(const struct md_fd_filter_gates *gates,struct md_fd_filter_program *out) {
-    const uintptr_t addresses[]={gates->raw,gates->watch,gates->task,gates->native};
+    const uintptr_t addresses[]={gates->raw,gates->watch,gates->task,gates->native,gates->adapter};
+    _Static_assert(sizeof(addresses)/sizeof(*addresses)==MD_FD_FILTER_GATES,"FD gate capacity");
     unsigned seen=0;
     for (unsigned i=0;i<sizeof(addresses)/sizeof(*addresses);++i) {
         if (!addresses[i] || (seen&(1u<<i))) continue;
-        unsigned low[4],count=0,high=(unsigned)(addresses[i]>>32);
+        unsigned low[MD_FD_FILTER_GATES],count=0,high=(unsigned)(addresses[i]>>32);
         for (unsigned j=i;j<sizeof(addresses)/sizeof(*addresses);++j)
             if (addresses[j] && (unsigned)(addresses[j]>>32)==high) {
                 seen|=1u<<j;
@@ -46,7 +47,7 @@ static int finish(const struct md_fd_filter_gates *gates,struct md_fd_filter_pro
         unsigned action=insn->k,j=0;
         while (j<used && actions[j]!=action) ++j;
         if (j==used) {
-            if (used==3 || out->count+21>MD_FD_FILTER_INSTRUCTIONS) return -E2BIG;
+            if (used==3 || out->count+MD_FD_FILTER_EXEMPTIONS>MD_FD_FILTER_INSTRUCTIONS) return -E2BIG;
             actions[used]=action; targets[used++]=out->count;
             exemptions(gates,out);
             out->code[out->count++]=(struct sock_filter)BPF_STMT(BPF_RET|BPF_K,action);
@@ -82,7 +83,7 @@ int md_fd_filter_build(enum md_fd_selector_kind kind,int fd,
 #define PROC(n,argument) CONTROL(n,argument,MD_INTERCEPT_PROC)
 #define COPY_PROGRAM(...) do { \
     struct sock_filter code[]={__VA_ARGS__}; \
-    _Static_assert(1+3*21+sizeof(code)/sizeof(*code)<=MD_FD_FILTER_INSTRUCTIONS,"FD filter capacity"); \
+    _Static_assert(1+3*MD_FD_FILTER_EXEMPTIONS+sizeof(code)/sizeof(*code)<=MD_FD_FILTER_INSTRUCTIONS,"FD filter capacity"); \
     for (unsigned i=0;i<sizeof(code)/sizeof(*code);++i) out->code[out->count++]=code[i]; \
     return finish(gates,out); \
 } while (0)
@@ -109,6 +110,14 @@ int md_fd_filter_build(enum md_fd_selector_kind kind,int fd,
         DUPLICATES
     );
     if (kind==MD_FD_SELECTOR_PROC) COPY_PROGRAM(
+        /* CLOEXEC belongs to the descriptor table, not its provider. The base
+         * filter observes the native mutation and publishes its exact result. */
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_ioctl,0,5),
+        BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,args[1])),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,FIOCLEX,1,0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,FIONCLEX,0,1),
+        BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_LD|BPF_W|BPF_ABS,offsetof(struct seccomp_data,nr)),
         /* Controlled shared mappings may have a writable provider backing.
          * Only tasks admitting controlled descriptors acquire this check. */
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_mprotect,0,4),
@@ -117,6 +126,7 @@ int md_fd_filter_build(enum md_fd_selector_kind kind,int fd,
         BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_TRACE|MD_INTERCEPT_MEMORY),
         BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW),
         PROC(read,0) PROC(write,0) PROC(readv,0) PROC(writev,0)
+        CONTROL(sendto,0,MD_INTERCEPT_DISPATCH) CONTROL(recvfrom,0,MD_INTERCEPT_DISPATCH)
         PROC(pread64,0) PROC(pwrite64,0)
         PROC(preadv,0) PROC(pwritev,0) PROC(preadv2,0) PROC(pwritev2,0)
         PROC(lseek,0) PROC(ioctl,0)

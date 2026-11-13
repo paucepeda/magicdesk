@@ -13,6 +13,10 @@ Privileged features use Shizuku, a compatible provider such as Shevery, or
 optional direct root. Termux terminals and Termux-hosted Linux graphics can
 work without any privileged service or managed Desktop.
 
+**Linux and Kubernetes without Shizuku or Android root:** Shroot's **User**
+mode runs under MagicDesk's ordinary app UID, with verified single-node k3s
+on Alpine. See [Linux with Shroot](#linux-with-shroot) for scope and test evidence.
+
 [Latest release](https://github.com/mekhontsev/magicdesk/releases/latest) |
 [Development APK](https://github.com/mekhontsev/magicdesk/releases/download/development/MagicDesk-development.apk) |
 [Getting started](docs/getting-started.md) |
@@ -67,9 +71,11 @@ tasks without recreating Activities. Start includes search, pins, app actions,
 widgets, notifications, media controls and capture tools.
 
 Every Start has a destination selector: **Current** launches on its own screen.
-Choose app-default placement, a Desktop window, Desktop fullscreen, or an
-independent fullscreen application. **Apps** opens the same Start without
-Desktop. Opening an app does not redirect mouse or keyboard input.
+Choose app-default placement, **Window**, **Fullscreen**, or an explicitly
+independent application. **Apps** opens the same Start without Desktop.
+Windowed launch without Desktop requires Shell access and supporting firmware;
+stock Nubia windowing requires managed Desktop. Opening an app does not
+redirect mouse or keyboard input.
 
 MagicDesk acquires HOME for managed Desktop and restores the previous role after
 the last Desktop closes. **Close desktop** releases surviving applications as
@@ -85,6 +91,10 @@ Choose **App scale > Custom** in an application's Desktop context menu.
 **Interface scale** ranges from 50% to 200% of the display density; **System**
 removes the override. Saved profiles also appear in
 **Settings > Application profiles**.
+
+Linux launchers expose **Interface scale** directly in their context menu for
+User, Shell and Termux execution, with the same setting in **Linux graphics**.
+Their scale also applies without managed Desktop.
 
 The preference follows managed windows through snap, maximize and fullscreen.
 Returning to ordinary phone use removes the active override but retains the
@@ -128,17 +138,18 @@ or incomplete; profile-qualified identities alone do not establish that support.
 ### A Full Terminal, With Or Without Desktop
 
 Interactive PTYs support editors, file managers and CLI tools, with ANSI colors,
-scrollback, alternate screens and terminal mouse reporting. Android-shell and
-Termux sessions share the renderer, controls and automation API.
+scrollback, alternate screens and terminal mouse reporting. **User** (MagicDesk's
+app UID), **Shell** (the authorized service) and **Termux** sessions share the
+renderer, controls and automation API.
 
 ![Terminal graphics and the shared CLI](docs/images/magicdesk-terminal.png)
 
 - Bundled JetBrains Mono Nerd Font, per-window size, pinch and Ctrl+wheel zoom.
 - Static Sixel and inline Kitty graphics, including placeholders through tmux.
 - Clickable links, titles, notifications, progress and OSC-marked command output.
-- Persistent Android-shell recall through bundled upstream mksh.
+- Persistent User/Shell command recall through bundled upstream mksh.
 - Touch scrolling, selection handles, Android keyboard resizing and paragraph copy.
-- One picker for retained shell/Termux PTYs and discovered tmux sessions.
+- One picker for retained User/Shell/Termux PTYs and discovered tmux sessions.
 - Session files and folders from Android's picker, camera or clipboard, with
   quoted paths for shell and supported guest sessions. Delete copies individually
   or end their session to remove them together.
@@ -189,7 +200,8 @@ For Termux applications, enable Termux external commands, grant MagicDesk
 Use **Refresh** after installing packages.
 
 Choose the destination and window mode as for Android applications. Launching an
-existing entry returns to its window; **New window** requests another instance,
+existing entry returns to its window; **New window**, at the end of the context
+menu, requests another instance for the selected Open action only,
 subject to the application's rules.
 
 X11 and Wayland share Android clipboard/file exchange, audio, interface scaling
@@ -244,14 +256,29 @@ See [custom launchers](docs/desktop-entries.md#custom-linux-entry-scripts).
 ### Linux With Shroot
 
 **[Shroot](docs/shroot.md) runs ARM64 Linux userspace on Android's existing
-kernel without Android root, a VM, Termux or PRoot.** The normal executor is
-Android shell UID 2000, supplied by Shizuku or Shevery.
+kernel without Android root, a VM, Termux or PRoot.** Choose **User** to run under
+MagicDesk's app UID without Shizuku, or **Shell** for the authorized command
+service, normally UID 2000. Each executor has its own Linux library.
 
-Its userspace syscall engine supplies supported filesystem, credential,
-namespace and networking interfaces missing from the host's kernel configuration
-or shell permissions. It neither installs a guest kernel nor changes SELinux.
+User and Shell use the same userspace syscall engine. It supplies supported
+filesystem, credential, namespace and networking interfaces missing from the
+host's kernel configuration or executor permissions. Guest namespaces, mounts
+and virtual network interfaces do not require permission to create their native
+Android counterparts. Shroot neither installs a guest kernel nor changes SELinux;
+Android still enforces the selected executor's host permissions and resource limits.
 
-Verified scenarios include:
+**Verified under an ordinary Android app UID, without Shizuku or Android root:**
+recipe-installed Alpine runs stock **runc** containers and a **single-node k3s
+(Kubernetes) cluster**, including CoreDNS, pod-to-pod and Service traffic,
+NetworkPolicy, persistent volumes, ingress and server restart. Stock Chromium
+also passes software-rendered browser checks with its namespace and set-ID
+sandboxes. User mode is not limited to lightweight command-line utilities.
+See [app-UID test evidence](native/guest-exec-lab/host-execution.md#qualifying-evidence)
+for the tested device and exact scope. The broader Docker, Podman, systemd and
+multi-node matrix below includes Shell results; those results do not by themselves
+establish the same application coverage in User mode.
+
+Across the tested executors, verified scenarios include:
 
 | Area | Scope |
 | --- | --- |
@@ -322,8 +349,9 @@ lower is better.**
 #### Install Linux
 
 Open MagicDesk, tap the terminal icon beside **Settings**, then choose
-**New session > Console**. Run these commands there, not in Termux or inside
-Linux. No MagicDesk Desktop session is needed; see
+**New session > User** or **Shell**. The installer uses that console's Linux
+library; use the same executor when resuming. Run these commands there, not in
+Termux or inside Linux. No MagicDesk Desktop session is needed; see
 [opening the Android shell console](docs/getting-started.md#open-the-android-shell-console)
 for access setup and other terminal types.
 
@@ -522,8 +550,10 @@ release still need verification. See [compatibility](docs/compatibility.md) and
 
 ## Input And Optional Features
 
-**Control input** routes physical Android keyboards and mice independently of
-Desktop. Android retains layouts, repeat, pointer acceleration and hover.
+**Control input** routes physical Android keyboards, mice and external
+touchscreens independently of Desktop. Android retains layouts, repeat,
+pointer acceleration, hover and multitouch. Touchscreens must be recognized
+by Android; the phone's built-in touchscreen keeps its own routing.
 The optional phone touchpad supplies a relative mouse; the normal Android IME
 handles text. **Show keyboard on app display** requests the IME beside the app,
 subject to firmware and keyboard support.

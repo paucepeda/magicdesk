@@ -4,6 +4,7 @@ This guide describes the machine-entry contract and its regression fixtures.
 
 - [Product Boundary](#product-boundary)
 - [Regression Commands](#regression-commands)
+- [Task-Channel Acceptance](#task-channel-acceptance)
 - [Admission Limits](#admission-limits)
 
 ## Product Boundary
@@ -12,6 +13,14 @@ The ordinary bootstrap/supervisor enables lazy entry by default for inode-store
 launches. `--env SHROOT_MACHINE_ENTRY=0` selects Base. It does not launch a
 discovery debugger. Bootstrap allocates private frames and near-code pools;
 `interception_memory` owns the registry across CLONE_VM, fork and exec.
+Reachable code pools grow on demand: the memory owner borrows the intercepted
+task for an RX anonymous `MAP_FIXED_NOREPLACE` allocation in an observed free gap.
+It restores the original stop before publishing code, without stopping peers or
+replacing an application's mapping. The pool inventory and broker snapshot grow
+with the address space; there is no fixed pool-count limit. Cold notification
+and TRACE entries use the same allocator. The distant-site fixture requires
+first-call publication in 24 disjoint regions, with argument-sensitive seccomp
+and fork, rather than accepting successful Base execution as evidence.
 First observed execution can publish a single SVC replacement without a peer
 stop, predecessor witness or hot-site threshold. Observed syscall numbers at
 one instruction share a chain of immutable guarded entries.
@@ -30,14 +39,24 @@ instruction uses the existing atomic publication path; no partial gate becomes
 reachable through a published branch. This reduces cold startup work without
 changing the warm entry path or making proc-write permission mandatory.
 
-A newly published worker/FD/value entry can also serve the first, unexecuted
-call. A cancelled notification already owns a post-kernel continuation; a
+A newly published worker/FD/value or admitted task entry can also serve the
+first, unexecuted call. A cancelled notification already owns a post-kernel continuation; a
 TRACE stop cancels its syscall and restores the complete context at exit before
 entering the new gate. Existing gates and retained interrupted results keep
 their ordinary completion path, so a pre-execution decline cannot loop back
-through the same gate. Task-route calls do not acquire gates just to reach the
-same Base dispatcher. Site-discovery coverage includes all first calls, not
-only later warmed iterations.
+through the same gate. Publication is independent of one invocation's fast-path
+eligibility: the common entry selects execution from the current number,
+arguments, policy and resource ownership. Site-discovery coverage includes all
+first calls, not only later warmed iterations. The first-encounter task fixture
+also asserts actual task-entry completions, including invalid output pointers
+and a guest filter denying selected arguments.
+The task-signal fixture creates, verifies and removes 512 files under a 100 us
+signal timer in Base and lazy modes. Exclusive creation detects any repeated
+side effect after an unadmitted BEGIN or an interrupted completion.
+Channel expansion also runs with thread-directed signals, both with and without
+a guest filter. Handlers check that their interrupted SP belongs to the
+application stack, not a private helper stack. A quiet tail separately verifies
+accelerated completion counts after signal recovery.
 
 `svc_machine.c` owns logical signal contexts, deferred siginfo, checkpoint return
 and necessary replay at the original instruction. It uses the existing interception
@@ -48,7 +67,18 @@ fixtures exercise the same transport independently of patch discovery.
 Memory changes retire overlapping entry points; resident continuations remain
 until address-space teardown. Debugger ownership disables machine admission.
 
-An unfiltered TRACE entry at a published site's native alias can use the same
+The common ingress evaluates the guest policy before selecting execution.
+Its local routing view uses the same base, FD, PID and signal program generators
+as kernel interception. Known native operations, direct errors and unconditional
+context requirements need no preliminary supervisor request. Shared-state
+operations reuse the existing resource owners over the task channel. A context
+request names its reason and precedes effects; an in-progress operation retains
+its completion owner instead of restarting from that request.
+Owned service gates precede the kernel guest-policy body, so an admitted helper
+does not execute it again. Original-site fallback and Android's inherited filters
+remain authoritative where local admission is unavailable.
+
+A TRACE entry at a published site's native alias can use the same
 Base syscall owner even when its number is new to that chain. Discovery uses
 the authenticated original PC and actual arguments; it may publish another
 gate for subsequent calls without replaying the current syscall. Publication
@@ -58,6 +88,11 @@ branch never implicitly admits another number. Memory profitability checks
 therefore apply equally to initial discovery, alias discovery and signal retry.
 Application filters, exposed address spaces and debugger ownership retain
 their original recovery and admission boundaries.
+For an admitted policy-mirror gate, the shared interception classifier restores
+the ordinary native or TRACE route after checking the original IP and arguments.
+The alias already has the caller's stack, so it needs no cancellation/replay
+solely because the mirror supplied a service cookie. Notification/error routes,
+filter installation and guest observation policies retain original-site recovery.
 
 Seccomp stops share one register snapshot between checkpoint recovery, executed
 site discovery and ordinary dispatch. Discovery precedes compact Base handlers:
@@ -76,10 +111,19 @@ debuggers retain full-context recovery; compact operands are never restored as
 an application's register image. Supervisor-state and mapping/signal tests cover
 these boundaries.
 
+Terminal native-wait coverage runs the same fixture natively, under Base and
+under lazy entry. It checks original PC/SP and arguments at signal delivery,
+EINTR, SA_RESTART, nonlocal handler exit, subsequent frame reuse and an already
+blocked read across TSYNC. The admitted read must finish while the next read
+obeys the new denial. Planner checks also collide a claim with an active native
+journal, then verify policy draining and fork cleanup. The resource wait fixture
+requires repeated filtered poll/select to complete without per-call stops.
+
 Private untracked `munmap` uses the same discovery ordering and an admitted
 native-memory callback. The sole address-space owner validates a snapshot of
 excluded mappings; it does not send a request to the filesystem worker. Shared,
-exposed, filtered or tracked cases retain ordinary interception. The mapping
+exposed or tracked cases retain ordinary interception; eligible filtered calls
+also check their original policy before the native effect. The mapping
 fixture verifies actual accelerated completions, page-rounded unmapping,
 misaligned-address rejection, signal-handler reentry and a subsequent seccomp
 denial. The ownership and revocation contract is described in
@@ -112,6 +156,10 @@ newer kernel arrival of the same signal. Both policies wait for reconstruction
 of the guest context, including the cancelled checkpoint's syscall-exit stop.
 Retry observation runs only in guest execution, never inside adapter allocation
 or another owner's native protocol.
+The instruction-level signal fixture includes positive-code `SIGCHLD` delivery
+at each covered entry stage, with context, altstack, restart and filter checks.
+The stock Go stress combines file IO, UDP, concurrent child exec/reaping, GC,
+preemption and CPU profiling, with and without an application seccomp filter.
 
 `test_cooperative_runtime.py --machine-entry` runs the existing complete entry
 contract. `test_svc_patch.py` and `test_svc_libc.py`
@@ -128,15 +176,23 @@ repair then handles a later NONE/R to RX transition if Android rejects the
 ptrace-created COW page. Failure to retain the initial provenance leaves Base
 entry selected; no writable-text permission is silently substituted.
 
-Before an application filter or `PR_SET_DUMPABLE(0)` commits, machine admission
+Before an application filter commits, machine admission
 is revoked. The existing cold task barrier, scoped to the affected address
 space, recovers resident entries or requests their return checkpoint. Peers
 then run to complete admitted calls under the old filter.
+After successful installation, a read-only policy view and owned kernel gates
+allow eligible entries to rearm. Original nr/args/IP admission precedes effects;
+ERRNO can complete locally, while other non-ALLOW actions retain original-site
+fallback. Fork shares immutable views. Exec publishes new views for portable
+IP-independent chains with an unconditionally allowed checkpoint; other
+inherited chains retain Base. Filter suspension preserves warm sites for lazy
+re-admission, while mapping retirement remains permanent.
 The original event is replayed only after those machine entries
 and their syscall-exit continuations have drained. This barrier is for these
-kernel transitions, not patch publication or ordinary accelerated calls. The
-dumpability transition restores source instructions before the kernel removes
-remote-memory access; it does not falsify the application's protected state.
+kernel transitions, not patch publication or ordinary accelerated calls.
+Guest dumpability is virtualized for proc access and debugging. Native
+dumpability remains enabled for the supervisor, so changing the guest value
+does not revoke accelerated entry or require a memory barrier.
 Cooperative channel revocation remains in the common owner: one caller for a local
 filter, its thread group for TSYNC. A blocked callback which does not drain in
 five seconds rejects the transition with EBUSY; it is not applied and
@@ -158,6 +214,7 @@ completions, revocation and actual resident-entry drains, not merely successful
 installation. Signal-boundary and full cooperative tests remain separate checks.
 The protected-state race repeats the same live callers across 24 dumpability
 transitions and verifies the state and syscall results in the parent and child.
+It requires continued accelerated completions without revocation or filter fences.
 Arbitrary externally mutable backing is not certified by this coverage.
 
 An interrupted kernel notification can restart at a newly published SVC gate.
@@ -170,12 +227,59 @@ and wait preparation use the same serviceability predicate. This avoids a
 duplicate filesystem effect, a recovery deadlock and a ready-but-unserviceable
 busy loop. Ordinary calls do not scan the site registry for this recovery.
 
-Public `cmdline` access after `dumpable=0` uses the actual proc open under
-caller authority. The supervisor's exact-mm retained memory description supplies
+Public `cmdline` access after `dumpable=0` uses guest inspection rules, independently
+of Android's proc restrictions. The supervisor's exact-mm retained memory description supplies
 live argument bytes when necessary; private image views such as `auxv` retain
 their inspection checks. The process-image fixture verifies
 post-protection argument edits and denied `auxv` natively, with Base and lazy
 entry, plus a differing guest-identity control.
+
+## Common-Entry Acceptance
+
+The qualified device is an NX809J, Android 16, kernel 6.12.23, with Alpine 3.23.6
+for stock application workloads. User and Shell use the same executable and
+fixture contracts. This is not coverage of another firmware or a physical 5.15
+kernel. The full SVC suite, signal-checkpoint suite, cooperative-entry contracts,
+and the supervisor-state, namespace, control-event, FS-buffer, FD-observation and
+task-mapping resource groups check completion, interruption, policy publication
+and original-context fallback
+independently of timing. Stock sandboxed headless Chromium with software video,
+Docker and Podman exercise real programs;
+their lazy completion counts are separate from merely starting successfully.
+
+The interleaved Shell comparison uses the saved `a383439f` runtime as reference,
+not Base. Both runtimes have lazy entry enabled. File batches contain 16 blocks
+of 1,024 operations, over four rounds;
+readiness contains 10,000 calls under a guest ALLOW filter, over four rounds.
+Timings have statistics disabled. CPU-frequency observations, per-command CPU
+usage, binary hashes and complete samples are in the run receipts. A separate
+12-round readiness repeat reverses the initial four-round timing difference;
+frequency changes prevent treating either aggregate as a stable speedup or
+slowdown. Those samples are retained in
+`build/common-entry-benchmark-readiness-repeat/`.
+
+In three interleaved 30-second Chromium video/input pairs against that reference,
+median supervisor-thread CPU was 20.63% versus 20.56%, and process CPU including
+its worker was 27.23% versus 26.73%. Median input latency was 29.81 versus
+25.03 ms. These counters exclude guest-process and Android compositor CPU;
+this series does not establish a general browser speedup. Frequency observations
+cover each command envelope, not a particular thread. Receipts are in
+`build/common-entry-browser-qualified-{0,1,2}-{reference,current}/`.
+
+Separate two-round Base/lazy video/input checks pass in both User and Shell.
+Instrumented 15-second runs complete 9,273 filtered calls in Shell and 10,298
+in User, with zero unknown entry outcomes. Guest-local native decisions total
+5,094 and 4,556 respectively; shared task completions total 4,455 and 4,433.
+These categories are not additive syscall totals. Context counters still show
+substantial wait and memory ownership: acceleration is not elimination of every
+ptrace stop. Browser receipts and nonblank captures are in
+`build/common-entry-browser-{shell,app}/` and the corresponding `browser-counts`
+directories. These are software headless checks, not GPU or HDMI qualification.
+
+File, readiness and startup receipts are in
+`build/common-entry-benchmark-{files,readiness,startup}/`. Base/lazy comparisons
+measure the complete lazy mechanism; reference/current comparisons isolate this
+change. Neither should be presented as the other.
 
 ## Regression Commands
 
@@ -193,6 +297,12 @@ python native/guest-exec-lab/test_svc_patch.py BUILD STOCK_GO --rounds 5
 python native/guest-exec-lab/test_svc_libc.py BUILD STOCK_LIBC_PROBE --checks-only --signal-storm
 ```
 
+The SVC runner's `--section` selects `entry`, `channels`, `filters`, `protected`, `images`,
+`mappings` or `programs` for focused diagnosis. Omit it for the complete suite;
+section runs retain the same assertions and record their scope in the report.
+Use `--diagnostics` to retain supervisor traces for integrated guests. These
+instrumented runs diagnose ownership, not ordinary-launch performance.
+
 `build_svc_go.py` builds stock Go/cgo fixtures; run the same SVC suite with
 each artifact. `build_svc_glibc.py` compiles a small test program against a stock
 sysroot. The libc runner also accepts a stock musl probe.
@@ -204,11 +314,13 @@ Use its `--dynamic-loader`, `--dynamic-libc`, `--interpreter` and
 | Cooperative runtime, Base and machine entry | Existing filesystem, FD, namespace, channel, memory, signal and debugger contracts |
 | SVC direct signals | Every executed gate instruction, logical register/stack state, negative controls and eight queued-RT scenarios |
 | SVC patch | Branch limits, original call identity, adjacent fault PC, raw assembly, mapping replacement, protected proc views, TSYNC and dumpability races, stock Go with/without filters |
+| SVC channel expansion | Native/Base/lazy registration and reuse, bounded 100-microsecond signal waves, original interrupted stack and signal delivery in every worker, quiet-tail accelerated completions |
 | Stock libc | ABI/contracts, 256 retired thread owners, optional asynchronous/blocked signal storms, dynamic loader variants |
 | Payload audit | Actual bootstrap driver has no hidden relocations; object bytes equal linked bytes |
 
-The live filter/protection races require 24 transitions and nonzero resident
-drains; a successful filter install alone is not sufficient.
+The live filter races require 24 transitions and nonzero resident drains;
+a successful filter install alone is not sufficient. Dumpability races retain
+direct entry with zero admission fences while checking guest protection state.
 
 ### Performance Controls
 
@@ -217,8 +329,9 @@ CPU affinity and rotated launch order. `--workload opens` measures 4,096
 open/close pairs; `--workload metadata` measures 32,768 metadata calls.
 Completion counters are verified in a separate untimed run. Timed runs all
 disable runtime statistics, whose clocks would otherwise bias the comparison.
-`--threaded` first enters libc's threaded mode. `--sandbox` measures the
-current original-SVC fallback after a filter, not acceleration inside it.
+`--threaded` first enters libc's threaded mode. `--sandbox` installs an actual
+guest filter; completion counters must establish whether its workload retains
+lazy entry or uses the original-site fallback.
 
 `test_cooperative_libc.py` also includes optional PRoot and reference-build
 controls. Explicit API callers belong to the separate correctness suite, not
@@ -254,7 +367,15 @@ focused entry fixture does not certify those independent workflows.
 ## Admission Limits
 
 Arbitrary self-modifying code, externally writable aliases, simultaneous
-debugger ownership, 64 KiB pages and SVE/SME/MTE/PAC/BTI are not certified by
-these tests. The guard layout supports 4/16 KiB pages; device coverage is 4 KiB.
+debugger ownership and SVE/SME/MTE/PAC/BTI are not certified by these tests.
+Frame, guard and code-pool alignment covers 4/16/64 KiB pages; actual device
+execution coverage is 4 KiB, not proof of a complete 64 KiB host launch.
+Site and pool metadata grow on publication and are independently copied on fork.
+Allocation failure or an address space with no reachable free gap retains Base.
+A new pool cannot be added under an IP-sensitive guest filter whose existing
+kernel mirror does not recognize that pool: fallback must not evaluate a
+different instruction address. Already admitted pools remain usable. This
+restriction is separate from stable service-gate admission and requires a
+stable original-context fallback before it can be removed.
 There is no claim of general instruction rewriting or unwind metadata.
 Unsupported sites retain Base without relaxing sandbox checks.

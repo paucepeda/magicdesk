@@ -85,8 +85,10 @@ when no origin, selected root or child placement retains them. Collection drops
 their object-cache records, policies and backing custody before slot reuse.
 A slot generation prevents stale snapshots from referring to its replacement.
 Nonrecursive topology changes check the selected operands' ancestry, not every
-unrelated attachment. Recursive operations, copying and table construction
-reconcile the complete graph. Recursive bind reconciles its source recursively,
+unrelated attachment. Recursive operations additionally reconcile the selected
+subtree; leaf mounts use the existing child index to avoid a graph walk.
+Namespace copying and table construction reconcile the complete graph.
+Recursive bind reconciles its source recursively,
 but only the target's ancestry: target admission does not copy its descendants.
 Logical link membership, or native
 link count for native targets, determines disconnection; rename retains the
@@ -268,6 +270,14 @@ old source pathname cannot redirect the imported graph. Mounted inode stores
 append deduplicated `inode_custody` parcels; their exact spans and root identities
 belong to the sealed graph. Even a repeated import validates all backing rights
 before reusing a known view. Forwarding retains those original leases.
+
+Host-backed sources and attachment points require an admission-time SCM_RIGHTS
+check: opening an O_PATH descriptor does not imply that the executor may receive
+it over a Unix socket. Startup binds and guest mount operations share this check.
+Nontransferable carriers keep their metadata in the existing local custody path;
+they are never published as incomplete portable graphs. Namespace copies retain
+the result, and placement changes check newly selected host carriers. Ordinary
+path lookup and file IO perform no transfer probe.
 
 Proc provider roots carry their immutable visibility and PSI-admission policy
 alongside the existing PID-namespace identity, upper-tree lease and superblock

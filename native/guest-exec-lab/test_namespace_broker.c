@@ -5,17 +5,22 @@
 #include "fs_native.h"
 #include "inode_internal.h"
 #include "../shroot/src/cooperative_channel.h"
+#include "../shroot/src/cooperative_exchange.h"
 #include "test_syscall_sites.h"
+#include "entry_wakeup.h"
+#include "process_owner.h"
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/futex.h>
 #include <linux/seccomp.h>
 #include <signal.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -29,9 +34,24 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 static atomic_int cancel_pid;
+static atomic_int queued_admission;
+static struct md_fd_origins *queued_table;
+static pid_t queued_owner;
+int __real_md_fd_order_begin(struct md_fd_origins *,struct md_fd_order *,struct md_resource_wakeup *);
+int __wrap_md_fd_order_begin(struct md_fd_origins *table,struct md_fd_order *turn,struct md_resource_wakeup *wake) {
+    if (atomic_load_explicit(&queued_admission,memory_order_acquire)==1
+            && table==queued_table && syscall(SYS_gettid)!=queued_owner) {
+        atomic_store_explicit(&queued_admission,2,memory_order_release);
+        /* EVENT_WAIT: the supervisor first observes active preparation. The
+         * fixture alarm fails a lost wake after that changes to QUEUED. */
+        while (atomic_load_explicit(&queued_admission,memory_order_acquire)!=3) sched_yield();
+    }
+    return __real_md_fd_order_begin(table,turn,wake);
+}
 static int signal_pipe[2];
 static void interrupted(int signal) {
     (void)signal;
@@ -173,7 +193,7 @@ static void failed_opens(const char *store) {
     assert(!md_task_registry_publish(tasks,child,child,&id,&resources));
     struct md_namespace_broker *broker=md_broker_create(worker,1,unexpected_delegate); assert(broker);
     md_broker_completion_handler(broker,unexpected_completion);
-    assert(!md_broker_task(broker,child,MD_BROKER_READ|MD_BROKER_OPEN,0,0,NULL));
+    assert(!md_broker_task(broker,child,MD_BROKER_READ|MD_BROKER_OPEN,0,0,NULL,1));
     md_broker_listen(broker,fd);
     assert(write(sockets[0],"r",1)==1);
     for (;;) {
@@ -213,7 +233,7 @@ static void run(const char *store,const char *native,int directory,int cancel) {
     struct md_identity identity=md_identity_new(0,0);
     assert(!md_task_registry_publish(tasks,child,child,&identity,&resources));
     struct md_namespace_broker *broker=md_broker_create(worker,1,unexpected_delegate); assert(broker);
-    assert(!md_broker_task(broker,child,1,0,0,NULL));
+    assert(!md_broker_task(broker,child,1,0,0,NULL,1));
     atomic_store(&cancel_pid,cancel ? child : 0);
     md_broker_listen(broker,fd);
     assert(write(channel[0],"r",1)==1);
@@ -253,13 +273,13 @@ static void discovery(const char *store) {
         alarm(25); close(channel[0]);
         int fd=listener(SYS_faccessat); send_listener(channel[1],fd); close(fd);
         char byte;
-        for (unsigned i=0;i<6+MD_TEST_SYSCALL_SITES*2+4;++i) {
+        for (unsigned i=0;i<6+MD_TEST_SYSCALL_SITES*2+6;++i) {
             /* EVENT_WAIT: parent advances this exact discovery generation. */
             assert(read(channel[1],&byte,1)==1 && byte=='r');
             unsigned site=i<6 || i>=6+MD_TEST_SYSCALL_SITES*2 ? 0 : (i-6)/2;
             md_test_syscall_fn call=i<6 ? result_call : md_test_syscall_site(site);
             long result=call(AT_FDCWD,(uintptr_t)"/entries",F_OK,0,0,0,SYS_faccessat);
-            int cold=i<6 ? i==0 || i==3 : !(i%2);
+            int cold=i>=6+MD_TEST_SYSCALL_SITES*2+4 || (i<6 ? i==0 || i==3 || i==4 : !(i%2));
             assert(result==(cold ? -EAGAIN : 0));
             assert(write(channel[1],"d",1)==1);
         }
@@ -278,16 +298,19 @@ static void discovery(const char *store) {
     assert(!md_task_registry_publish(tasks,child,child,&identity,&resources));
     struct md_namespace_broker *broker=md_broker_create(worker,1,discovery_delegate); assert(broker);
     unsigned eligible=MD_BROKER_READ|MD_BROKER_DISCOVERY;
-    assert(!md_broker_task(broker,child,eligible,0,0,NULL));
+    assert(!md_broker_task(broker,child,eligible,0,0,NULL,1));
     md_broker_listen(broker,discovery_listener);
-    for (unsigned i=0;i<6+MD_TEST_SYSCALL_SITES*2+4;++i) {
+    for (unsigned i=0;i<6+MD_TEST_SYSCALL_SITES*2+6;++i) {
         if (i==2) md_broker_resample(broker,child,(uintptr_t)result_return+4);
         if (i==3) md_broker_resample(broker,child,(uintptr_t)result_return);
-        if (i==5) assert(!md_broker_task(broker,child,eligible,0,0,NULL));
+        if (i==4) md_broker_resample(broker,child,0);
+        if (i==5) assert(!md_broker_task(broker,child,eligible,0,0,NULL,1));
         if (i==6+MD_TEST_SYSCALL_SITES*2+2) {
             md_broker_forget(broker,child);
-            assert(!md_broker_task(broker,child,eligible,0,0,NULL));
+            assert(!md_broker_task(broker,child,eligible,0,0,NULL,1));
         }
+        if (i==6+MD_TEST_SYSCALL_SITES*2+4)
+            assert(!md_broker_task(broker,child,MD_BROKER_COOPERATIVE|MD_BROKER_DISCOVERY,0,0,NULL,1));
         assert(write(channel[0],"r",1)==1);
         char byte;
         struct pollfd ready[]={{.fd=channel[0],.events=POLLIN},{.fd=md_fs_worker_fd(worker),.events=POLLIN}};
@@ -300,14 +323,15 @@ static void discovery(const char *store) {
         assert(read(channel[0],&byte,1)==1 && byte=='d');
     }
     int status; assert(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
-    assert(atomic_load(&discovery_calls)==4+MD_TEST_SYSCALL_SITES && !md_fs_worker_error(worker));
+    assert(atomic_load(&discovery_calls)==7+MD_TEST_SYSCALL_SITES && !md_fs_worker_error(worker));
     md_broker_forget(broker,child);
     assert(!md_fs_worker_stop(worker)); md_broker_destroy(broker);
     md_task_registry_destroy(tasks); md_identity_release(&identity);
     md_domain_release(resources.fs); md_fd_origins_release(resources.files);
     assert(!close(discovery_listener) && !close(channel[0]) && descriptors()==before);
-    puts("PASS broker discovery: one cold delegation, exact-site resampling, warm calls and eligibility refresh");
+    puts("PASS broker discovery: one cold delegation, exact/all-site resampling, warm calls and eligibility refresh");
     puts("PASS broker discovery cache: 32 sites, bounded repeat suppression, evicted-site retry and new owner");
+    puts("PASS broker admission: entry and discovery flags do not authorize raw notifications");
 }
 static void completed_result(const char *store,int nr) {
     unsigned before=descriptors();
@@ -346,7 +370,7 @@ static void completed_result(const char *store,int nr) {
     assert(!md_fs_worker_start(store,endpoint,NULL,tasks,NULL,NULL,&worker));
     struct md_fd_origins *files=md_fd_origins_new(); assert(files);
     struct md_namespace_broker *broker=md_broker_create(worker,1,unexpected_delegate); assert(broker);
-    assert(!md_broker_task(broker,child,0,0,0,NULL));
+    assert(!md_broker_task(broker,child,0,0,0,NULL,1));
     long value=-123;
     assert(!md_broker_result_finish(broker,child,&value) && value==-123);
     assert(!md_broker_result_begin(broker,child,&call,files,source,NULL,O_CLOEXEC));
@@ -433,6 +457,9 @@ static void managed_proc_reads(const char *store) {
                     fprintf(stderr,"proc boundary scenario=%u operation=%u result=%d\n",scenario,op,out.error);
                 assert(out.error==-EREMOTE); continue;
             }
+            if (out.error || out.host_path || out.fd!=-1)
+                fprintf(stderr,"proc boundary scenario=%u view=%u operation=%u result=%d fd=%d\n",
+                    scenario,view,op,out.error,out.fd);
             assert(!out.error && !out.host_path && out.fd==-1);
             if (op==2) assert(out.size==(size_t)length && !memcmp(data,expected,out.size));
             else if (op==1) assert(S_ISLNK(out.info.mode));
@@ -453,7 +480,7 @@ static void managed_proc_reads(const char *store) {
     assert(descriptors()==before);
     puts("PASS managed proc observations: socket identity, descriptor reuse, credentials, busy table and typed provider fallback, no FD leak");
 }
-static void stopped_queued_entry(const char *store,int status) {
+static void stopped_queued_entry(const char *store,int status,int admission) {
     unsigned before=descriptors();
     pid_t pid=getpid();
     struct md_task_registry *tasks=md_task_registry_create(); assert(tasks);
@@ -466,7 +493,7 @@ static void stopped_queued_entry(const char *store,int status) {
     struct md_identity id=md_identity_new(0,0);
     assert(!md_task_registry_publish(tasks,pid,pid,&id,&resources));
     struct md_namespace_broker *broker=md_broker_create(worker,0,unexpected_delegate); assert(broker);
-    assert(!md_broker_task(broker,pid,MD_BROKER_COOPERATIVE,0,0,NULL));
+    assert(!md_broker_task(broker,pid,MD_BROKER_COOPERATIVE,0,0,NULL,1));
     struct md_entry_channel channel;
     assert(!md_broker_cooperative_bind(broker,pid,&channel,1));
     assert(atomic_load(&channel.enabled) && channel.owner==pid);
@@ -476,14 +503,45 @@ static void stopped_queued_entry(const char *store,int status) {
     struct md_fd_order owner={0};
     assert(md_fd_order_begin(resources.files,&owner,NULL)==1 && !md_fd_order_start(&owner));
     int fd=open("/dev/null",O_RDONLY|O_CLOEXEC); assert(fd>=0);
+    int queued_wake=status==((PTRACE_EVENT_STOP<<16)|(SIGTRAP<<8)|0x7f);
+    if (queued_wake) {
+        queued_table=resources.files; queued_owner=syscall(SYS_gettid);
+        atomic_store_explicit(&queued_admission,1,memory_order_release);
+    }
     channel.sequence=1; channel.call.number=SYS_close; channel.call.args[0]=fd;
     atomic_store_explicit(&channel.state,MD_ENTRY_REQUEST,memory_order_release);
-    md_fs_worker_wake(worker);
+    md_broker_resumed(broker,pid);
     /* EVENT_WAIT: shared admission publication; the fixture alarm bounds loss. */
     while (atomic_load_explicit(&channel.state,memory_order_acquire)==MD_ENTRY_REQUEST) sched_yield();
     assert(atomic_load(&channel.state)==MD_ENTRY_RUNNING);
+    if (queued_wake) {
+        while (atomic_load_explicit(&queued_admission,memory_order_acquire)!=2) sched_yield();
+        struct pollfd ready={.fd=md_fs_worker_fd(worker),.events=POLLIN};
+        while (poll(&ready,1,0)==1) assert(!md_fs_worker_dispatch(worker));
+        int stopped=0;
+        assert(md_broker_native_borrow(broker,pid,&stopped)==-EBUSY);
+        atomic_store_explicit(&queued_admission,3,memory_order_release);
+        /* EVENT_WAIT: QUEUED itself wakes the borrower, before the retained
+         * table turn or any guest syscall can supply another event. */
+        assert(poll(&ready,1,5000)==1 && !md_fs_worker_dispatch(worker));
+        assert(md_broker_native_borrow(broker,pid,&stopped)==1 && !stopped);
+        md_broker_native_return(broker,pid);
+        atomic_store(&queued_admission,0); queued_table=NULL;
+    }
     assert(!md_broker_pending_events(broker));
+    /* An undecoded syscall stop belongs to its barrier, not retirement.
+     * Even an input register resembling a result cannot complete its journal. */
+    channel.native.number=SYS_close; channel.native.result=fd;
+    atomic_store(&channel.native.state,MD_NATIVE_RUNNING);
+    md_fd_view_publish(&channel.descriptor,fd,FD_CLOEXEC,S_IFCHR);
+    md_broker_park(broker,pid);
+    assert(!md_broker_pending_events(broker) && !atomic_load(&channel.descriptor.descriptor));
+    assert(atomic_load(&channel.native.state)==MD_NATIVE_RUNNING && channel.native.result==fd);
+    assert(atomic_load(&channel.state)==MD_ENTRY_RUNNING && fcntl(fd,F_GETFD)==FD_CLOEXEC);
     assert(md_broker_hold_event(broker,pid,status,NULL)==1);
+    assert(md_broker_pending_events(broker));
+    /* Publishing policy cannot release a kernel stop owned by retirement. */
+    assert(!md_broker_task(broker,pid,MD_BROKER_COOPERATIVE,0,0,NULL,0));
     assert(md_broker_pending_events(broker));
     pid_t observed=0; int returned=0;
     while (!observed) {
@@ -494,7 +552,7 @@ static void stopped_queued_entry(const char *store,int status) {
         assert(!md_fs_worker_dispatch(worker));
         int stopped=0;
         int borrowed=md_broker_native_borrow(broker,pid,&stopped);
-        assert(borrowed==(WIFSTOPPED(status) ? 1 : -ESRCH));
+        assert(borrowed==admission);
         /* Injection owns the held boundary until its registers are restored.
          * Publishing it early replays the old stop as an injected-call event. */
         if (borrowed==1) {
@@ -506,6 +564,20 @@ static void stopped_queued_entry(const char *store,int status) {
     }
     assert(observed==pid && returned==status && !md_broker_pending_events(broker));
     assert(atomic_load(&channel.state)==MD_ENTRY_RESPONSE && channel.receipt==1
+        && channel.outcome==MD_ENTRY_DECLINED);
+    /* The stopped task cannot publish another ordinary call, but an owned
+     * adapter may already have published a control/acknowledgement. Preserve
+     * it for resume, including when a signal arrives before worker admission. */
+    for (unsigned kind=MD_ENTRY_BUFFER_CONTROL;kind<=MD_ENTRY_NATIVE_REQUEST;++kind) {
+        if (kind==MD_ENTRY_EXECUTION_BEGIN) continue;
+        channel.sequence=2; channel.call.reserved=kind;
+        atomic_store_explicit(&channel.state,MD_ENTRY_REQUEST,memory_order_release);
+        assert(!md_broker_hold_event(broker,pid,status,NULL));
+        assert(atomic_load(&channel.state)==MD_ENTRY_REQUEST && channel.receipt==1);
+    }
+    channel.call.reserved=MD_ENTRY_EXECUTION_BEGIN;
+    assert(!md_broker_hold_event(broker,pid,status,NULL));
+    assert(atomic_load(&channel.state)==MD_ENTRY_RESPONSE && channel.receipt==2
         && channel.outcome==MD_ENTRY_DECLINED);
     assert(md_fd_order_state(&owner)==MD_RESOURCE_ORDER_RUNNING && fcntl(fd,F_GETFD)==FD_CLOEXEC);
     assert(!md_fd_order_complete(&owner) && !close(fd));
@@ -521,26 +593,73 @@ static struct {
     struct md_namespace_broker *broker;
     struct md_fs_worker *worker;
     struct md_entry_channel channel;
-    int listener,received;
+    int listener,received,control,native;
+    pid_t owner;
 } registration;
+static void registration_control(pid_t pid,struct md_entry_channel *c) {
+    assert(syscall(SYS_gettid)==registration.owner && pid==c->owner);
+    assert((c->call.reserved==MD_ENTRY_BUFFER_CONTROL || c->call.reserved==MD_ENTRY_EFFECT_DONE)
+        && atomic_load(&c->state)==MD_ENTRY_RUNNING);
+    int stopped=0;
+    assert(md_broker_native_borrow(registration.broker,pid,&stopped)==-EBUSY);
+    if (registration.native && c->call.reserved==MD_ENTRY_BUFFER_CONTROL) {
+        uint64_t args[6]={7,0,1,registration.native==2 ? (uint64_t)-1 : 0};
+        md_broker_entry_effect(registration.broker,c,SYS_epoll_pwait,args);
+        assert(atomic_load(&c->control_awake)==(registration.native==1));
+        return;
+    }
+    md_broker_entry_reply(registration.broker,c,MD_ENTRY_COMPLETED,0);
+}
 static void registration_delegate(const struct seccomp_notif *request) {
     assert(request->data.nr==SYS_gettid && !registration.received++);
     struct md_entry_channel *c=&registration.channel;
-    assert(!md_broker_task(registration.broker,request->pid,MD_BROKER_COOPERATIVE,0,0,NULL));
+    assert(!md_broker_task(registration.broker,request->pid,MD_BROKER_COOPERATIVE,0,0,NULL,1));
     assert(!md_broker_cooperative_bind(registration.broker,request->pid,c,1));
     struct seccomp_notif_resp reply={.id=request->id,.val=request->pid};
     assert(!ioctl(registration.listener,SECCOMP_IOCTL_NOTIF_SEND,&reply));
     /* Publish the next caller request while this delegated operation still
      * owns the task. Force the worker's pre-wait scan to precede retirement. */
     c->sequence=1; c->call.number=SYS_getuid;
-    atomic_store(&c->awake,1); atomic_store(&c->sleeping,1);
+    c->call.reserved=registration.control ? MD_ENTRY_BUFFER_CONTROL : MD_ENTRY_SYSCALL;
+    atomic_store(&c->sleeping,1);
     atomic_store(&c->state,MD_ENTRY_REQUEST);
-    md_fs_worker_wake(registration.worker);
-    /* EVENT_WAIT: worker acknowledges its park intent; alarm bounds failure. */
-    while (atomic_load(&c->awake)) sched_yield();
+    md_broker_resumed(registration.broker,request->pid);
+    if (registration.control) {
+        struct md_entry_channel primer;
+        if (registration.control==2) {
+            assert(!md_broker_task(registration.broker,registration.owner,MD_BROKER_COOPERATIVE,0,0,NULL,1));
+            assert(!md_broker_cooperative_bind(registration.broker,registration.owner,&primer,1));
+            primer.sequence=1; primer.call.reserved=MD_ENTRY_BUFFER_CONTROL;
+            atomic_store_explicit(&primer.state,MD_ENTRY_REQUEST,memory_order_release);
+            md_broker_resumed(registration.broker,registration.owner);
+        }
+        assert(!!md_broker_entry_progress(registration.broker)==(registration.control==2));
+        assert(!atomic_load(&c->control_awake));
+        if (registration.control==2) {
+            assert(atomic_load(&primer.state)==MD_ENTRY_RESPONSE && primer.receipt==1);
+            md_broker_forget(registration.broker,registration.owner);
+        }
+    } else {
+        /* EVENT_WAIT: worker acknowledges its park intent; alarm bounds failure. */
+        while (atomic_load(&c->awake)) sched_yield();
+    }
     assert(atomic_load(&c->state)==MD_ENTRY_REQUEST);
 }
-static void registration_retirement(const char *store) {
+static void *registration_publish(void *unused) {
+    (void)unused;
+    struct md_entry_channel *c=&registration.channel;
+    for (uint64_t sequence=4;sequence<132;++sequence) {
+        c->sequence=sequence;
+        atomic_store_explicit(&c->state,MD_ENTRY_REQUEST,memory_order_release);
+        md_broker_resumed(registration.broker,c->owner);
+        /* EVENT_WAIT: the control owner publishes this exact receipt; the
+         * fixture alarm fails a lost wake across snapshot/park handoff. */
+        while (atomic_load_explicit(&c->state,memory_order_acquire)!=MD_ENTRY_RESPONSE) sched_yield();
+        assert(c->receipt==sequence && c->outcome==MD_ENTRY_COMPLETED);
+    }
+    return NULL;
+}
+static void registration_retirement(const char *store,int control) {
     unsigned before=descriptors();
     int sockets[2]; assert(!socketpair(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0,sockets));
     pid_t parent=getpid(),child=fork(); assert(child>=0);
@@ -555,6 +674,7 @@ static void registration_retirement(const char *store) {
         assert(read(sockets[1],&byte,1)==1 && byte=='c'); _exit(0);
     }
     close(sockets[1]); memset(&registration,0,sizeof(registration));
+    registration.control=control; registration.owner=syscall(SYS_gettid);
     registration.listener=receive_listener(sockets[0]);
     struct md_task_registry *tasks=md_task_registry_create(); assert(tasks);
     char endpoint[80]; snprintf(endpoint,sizeof(endpoint),"md-entry-retirement-%d",parent);
@@ -565,7 +685,9 @@ static void registration_retirement(const char *store) {
     struct md_identity identity=md_identity_new(0,0);
     assert(!md_task_registry_publish(tasks,child,child,&identity,&resources));
     registration.broker=md_broker_create(registration.worker,0,registration_delegate);
-    assert(registration.broker && !md_broker_task(registration.broker,child,MD_BROKER_READ,0,0,NULL));
+    md_broker_entry_handler(registration.broker,registration_control);
+    md_broker_entry_target(registration.broker,parent);
+    assert(registration.broker && !md_broker_task(registration.broker,child,MD_BROKER_READ,0,0,NULL,1));
     md_broker_listen(registration.broker,registration.listener);
     assert(write(sockets[0],"r",1)==1);
     while (!registration.received) {
@@ -574,7 +696,9 @@ static void registration_retirement(const char *store) {
         assert(poll(&ready,1,5000)==1 && !md_fs_worker_dispatch(registration.worker));
     }
     struct md_entry_channel *c=&registration.channel;
+    assert(c->control_target==parent);
     for (;;) {
+        if (control) md_broker_entry_progress(registration.broker);
         unsigned state=atomic_load(&c->state);
         if (state==MD_ENTRY_RESPONSE) break;
         assert(state==MD_ENTRY_REQUEST || state==MD_ENTRY_RUNNING);
@@ -586,9 +710,77 @@ static void registration_retirement(const char *store) {
     }
     assert(atomic_load(&c->state)==MD_ENTRY_RESPONSE && c->receipt==1
         && c->outcome==MD_ENTRY_COMPLETED && !c->result);
+    if (control) for (unsigned update=0;update<2;++update) {
+        assert(!atomic_load(&c->control_awake));
+        int stopped=(PTRACE_EVENT_STOP<<16)|(SIGTRAP<<8)|0x7f;
+        assert(!md_broker_hold_event(registration.broker,child,stopped,NULL));
+        c->sequence=update+2;
+        atomic_store(&c->state,MD_ENTRY_REQUEST);
+        assert(!md_broker_task(registration.broker,child,MD_BROKER_COOPERATIVE,0,0,NULL,0));
+        md_broker_entry_wake(registration.broker,child);
+        assert(!md_broker_entry_progress(registration.broker));
+        assert(atomic_load(&c->state)==MD_ENTRY_REQUEST);
+        if (update) assert(!md_broker_task(registration.broker,child,MD_BROKER_COOPERATIVE,0,0,NULL,1));
+        else md_broker_resumed(registration.broker,child);
+        /* Resumption alone must target the supervisor, not the worker. */
+        assert(md_broker_entry_progress(registration.broker));
+        assert(atomic_load(&c->state)==MD_ENTRY_RESPONSE && c->receipt==update+2
+            && c->outcome==MD_ENTRY_COMPLETED && !c->result);
+        /* A dispatched callback requires one resource-owner progress pass,
+         * but an idle channel must not keep the supervisor spinning. */
+        assert(!md_broker_entry_progress(registration.broker));
+    }
+    if (control) {
+        pthread_t publisher;
+        assert(!pthread_create(&publisher,NULL,registration_publish,NULL));
+        for (;;) {
+            int progress=md_broker_entry_progress(registration.broker);
+            if (atomic_load_explicit(&c->state,memory_order_acquire)==MD_ENTRY_RESPONSE && c->receipt==131) break;
+            if (progress) continue;
+            /* EVENT_WAIT: either a cold enrollment or a retained hot request
+             * wakes this owner; no new notification rescues a missed request. */
+            struct pollfd ready={md_fs_worker_fd(registration.worker),POLLIN,0};
+            assert(poll(&ready,1,5000)==1 && !md_fs_worker_dispatch(registration.worker));
+        }
+        assert(!pthread_join(publisher,NULL));
+        for (unsigned blocking=0;blocking<2;++blocking) {
+            registration.native=blocking+1;
+            c->sequence=132+2*blocking; c->call.reserved=MD_ENTRY_BUFFER_CONTROL;
+            assert(md_entry_publish_request(c,MD_ENTRY_REQUEST));
+            md_broker_resumed(registration.broker,c->owner);
+            assert(md_broker_entry_progress(registration.broker));
+            assert(atomic_load(&c->state)==MD_ENTRY_NATIVE && !atomic_load(&c->control_awake));
+            assert(!md_broker_entry_progress(registration.broker));
+            /* Completion after park must enroll the exact control owner,
+             * whether the native operation blocked or returned immediately. */
+            c->native.result=0; atomic_store(&c->native.state,MD_NATIVE_DONE);
+            ++c->sequence; c->call.reserved=MD_ENTRY_EFFECT_DONE;
+            assert(md_entry_publish_request(c,MD_ENTRY_REQUEST));
+            md_broker_resumed(registration.broker,c->owner);
+            assert(md_broker_entry_progress(registration.broker));
+            assert(atomic_load(&c->state)==MD_ENTRY_RESPONSE && c->receipt==c->sequence);
+        }
+        registration.native=0;
+    }
+    if (control==2) {
+        for (unsigned i=0;i<128;++i) {
+            c->sequence=136+i; c->call.reserved=MD_ENTRY_BUFFER_CONTROL;
+            assert(md_entry_publish_request(c,MD_ENTRY_REQUEST));
+            md_broker_entry_wake(registration.broker,INT_MAX);
+            assert(!md_broker_entry_progress(registration.broker));
+            md_broker_entry_wake(registration.broker,c->owner);
+            md_broker_entry_wake(registration.broker,c->owner);
+            assert(md_broker_entry_progress(registration.broker));
+            assert(c->receipt==136+i && atomic_load(&c->state)==MD_ENTRY_RESPONSE);
+            md_broker_entry_wake(registration.broker,c->owner);
+            assert(!md_broker_entry_progress(registration.broker));
+        }
+    }
     assert(write(sockets[0],"c",1)==1); int status;
     assert(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
     md_broker_forget(registration.broker,child);
+    md_broker_entry_wake(registration.broker,child);
+    assert(!md_broker_entry_progress(registration.broker));
     assert(!md_fs_worker_stop(registration.worker)); md_broker_destroy(registration.broker);
     close(registration.listener); close(sockets[0]);
     md_task_registry_destroy(tasks); md_domain_release(resources.fs);
@@ -596,8 +788,61 @@ static void registration_retirement(const char *store) {
     assert(descriptors()==before);
     puts("PASS delegated retirement: published next request wakes after parked worker without another guest syscall");
 }
+static void direct_wake_transport(void) {
+    pid_t child=fork(); assert(child>=0);
+    if (!child) {
+        struct md_kernel_action ignored={.handler=(uintptr_t)SIG_IGN},restored;
+        assert(!RAW4(rt_sigaction,MD_ENTRY_WAKE_SIGNAL,&ignored,0,8));
+        uint64_t before,after;
+        assert(!RAW4(rt_sigprocmask,SIG_SETMASK,0,&before,8));
+        struct rlimit files,none;
+        assert(!getrlimit(RLIMIT_NOFILE,&files));
+        none=files; none.rlim_cur=0;
+        assert(!setrlimit(RLIMIT_NOFILE,&none));
+        assert(md_entry_wakeup_open()==-EMFILE);
+        assert(!setrlimit(RLIMIT_NOFILE,&files));
+        assert(!RAW4(rt_sigprocmask,SIG_SETMASK,0,&after,8) && before==after);
+        assert(!RAW4(rt_sigaction,MD_ENTRY_WAKE_SIGNAL,0,&restored,8));
+        assert(restored.handler==ignored.handler && !restored.mask && !restored.flags);
+        int fd=md_entry_wakeup_open(); assert(fd>=0);
+        const pid_t owner=getpid();
+        pid_t sender=fork(); assert(sender>=0);
+        if (!sender) {
+            for (int i=1;i<=128;++i) assert(!md_entry_wakeup_send(owner,i));
+            _exit(0);
+        }
+        unsigned received=0;
+        while (received<128) {
+            struct pollfd ready={fd,POLLIN,0};
+            /* EVENT_WAIT: the exact native endpoint receives queued caller
+             * hints; bounded failure catches coalescing or lost delivery. */
+            assert(poll(&ready,1,5000)==1);
+            int callers[32],count=md_entry_wakeup_read(fd,callers,32);
+            assert(count>0);
+            for (int i=0;i<count;++i) assert(callers[i]==(int)++received);
+        }
+        int status;
+        assert(waitpid(sender,&status,0)==sender && WIFEXITED(status) && !WEXITSTATUS(status));
+        int caller;
+        assert(!md_entry_wakeup_read(fd,&caller,1));
+        assert(md_entry_wakeup_send(INT_MAX,owner)==-ESRCH);
+        struct rlimit previous,empty;
+        assert(!getrlimit(RLIMIT_SIGPENDING,&previous));
+        empty=previous; empty.rlim_cur=0;
+        assert(!setrlimit(RLIMIT_SIGPENDING,&empty));
+        assert(md_entry_wakeup_send(owner,owner)==-EAGAIN);
+        assert(!setrlimit(RLIMIT_SIGPENDING,&previous));
+        assert(!md_entry_wakeup_send(owner,owner));
+        assert(md_entry_wakeup_read(fd,&caller,1)==1 && caller==owner);
+        assert(!close(fd)); _exit(0);
+    }
+    int status;
+    assert(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    puts("PASS direct control wake: open rollback, queued identities, bounded reads, dead owner and queue exhaustion");
+}
 void md_test_namespace_broker(const char *root) {
     setbuf(stdout,NULL); alarm(60);
+    direct_wake_transport();
     extern void md_test_notification_result(void);
     md_test_notification_result();
     assert(!mkdir(root,0700));
@@ -626,8 +871,17 @@ void md_test_namespace_broker(const char *root) {
     assert(!close(directory) && !close(attached));
     completed_result(store,SYS_fstat); completed_result(store,SYS_gettid);
     managed_proc_reads(store);
-    stopped_queued_entry(store,(PTRACE_EVENT_STOP<<16)|(SIGTRAP<<8)|0x7f);
-    stopped_queued_entry(store,SIGKILL);
-    discovery(store); registration_retirement(store); alarm(0);
+    stopped_queued_entry(store,(PTRACE_EVENT_STOP<<16)|(SIGTRAP<<8)|0x7f,1);
+    stopped_queued_entry(store,(PTRACE_EVENT_SECCOMP<<16)|(SIGTRAP<<8)|0x7f,1);
+    stopped_queued_entry(store,((SIGTRAP|0x80)<<8)|0x7f,1);
+    stopped_queued_entry(store,(SIGCHLD<<8)|0x7f,-EBUSY);
+    stopped_queued_entry(store,(SIGSEGV<<8)|0x7f,-EBUSY);
+    stopped_queued_entry(store,(PTRACE_EVENT_STOP<<16)|(SIGSTOP<<8)|0x7f,-EBUSY);
+    stopped_queued_entry(store,(PTRACE_EVENT_CLONE<<16)|(SIGTRAP<<8)|0x7f,-EBUSY);
+    stopped_queued_entry(store,(PTRACE_EVENT_EXEC<<16)|(SIGTRAP<<8)|0x7f,-ESRCH);
+    stopped_queued_entry(store,(PTRACE_EVENT_EXIT<<16)|(SIGTRAP<<8)|0x7f,-ESRCH);
+    stopped_queued_entry(store,SIGKILL,-ESRCH);
+    discovery(store); registration_retirement(store,0); registration_retirement(store,1);
+    registration_retirement(store,2); alarm(0);
     puts("PASS broker directory notification ownership");
 }

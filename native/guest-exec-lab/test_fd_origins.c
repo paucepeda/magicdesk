@@ -10,10 +10,12 @@
 #include "fd_receipt.h"
 #include "fd_channel.h"
 #include "fd_native_pin.h"
+#include "descriptor_inode.h"
 #include "fd_return.h"
 #include "received_fds.h"
 #include "fd_messages.h"
 #include "control_file.h"
+#include "signal_origin.h"
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
@@ -25,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -51,6 +54,59 @@ static unsigned descriptors(void) {
     closedir(d); return n;
 }
 static int retired_gone(pid_t pid) { return pid==20003; }
+static void task_reaped_sender(void) {
+    uint32_t limit=md_user_namespace_limit(NULL,MD_USER_NAMESPACES);
+    assert(!md_user_namespace_set_limit(NULL,MD_USER_NAMESPACES,1));
+    for (unsigned namespaced=0;namespaced<2;++namespaced) for (unsigned reuse=0;reuse<2;++reuse) {
+        struct md_task_registry *r=md_task_registry_create(); assert(r);
+        struct md_identity id=md_identity_new(1000,1000);
+        id.user_namespace=md_user_namespace_new(NULL,1000,1000,0); assert(id.user_namespace);
+        struct md_task_resources resources; assert(!md_resources_init(&resources,NULL));
+        if (namespaced) {
+            struct md_pid_namespace *space=md_pid_namespace_new(NULL,id.user_namespace); assert(space);
+            assert(!md_pid_identity_prepare(space,&resources.pid));
+            assert(!md_pid_identity_publish(resources.pid,20003,20003));
+            md_pid_namespace_release(space);
+        }
+        assert(!md_task_registry_publish(r,20003,20003,&id,&resources));
+        md_pid_identity_exit(resources.pid);
+        md_task_registry_retire(r,20003,20002,&id);
+        assert(!md_resources_release(&resources)); md_identity_release(&id);
+        assert(!md_user_namespace_new(NULL,1000,1000,0) && errno==ENOSPC);
+        allocation_budget=0;
+        md_task_registry_reap_deferred(r,20003);
+        assert(!!md_task_registry_retired(r,20003).identity==namespaced);
+        allocation_budget=-1;
+        md_task_registry_reap_deferred(r,20003);
+        md_task_registry_reap_deferred(r,20003);
+        assert(!md_task_registry_retired(r,20003).identity);
+        assert(md_task_registry_retired(r,20003).parent==20002);
+        struct md_task_credentials credentials; struct md_task_snapshot proc;
+        assert(md_task_registry_credentials(r,20003,&credentials)==-ESRCH);
+        assert(md_task_registry_proc(r,20003,&proc)==-ESRCH);
+        assert(md_task_registry_probe(r,20003,0,&proc)==-ESTALE);
+        struct md_user_namespace *next=md_user_namespace_new(NULL,1000,1000,0); assert(next);
+        md_user_namespace_release(next);
+        siginfo_t info={.si_signo=SIGCHLD,.si_code=CLD_EXITED};
+        info.si_pid=20003; info.si_uid=10647; info.si_status=7;
+        struct md_signal_origin origin;
+        assert(md_task_registry_signal_origin(r,&info,&origin));
+        assert(md_signal_origin_matches(&origin,&info) && origin.uid==1000 && origin.count==namespaced);
+        if (namespaced) assert(origin.numbers[0].number==1);
+        if (reuse) {
+            id=md_identity_new(2000,2000);
+            assert(!md_task_registry_publish(r,20003,20003,&id,NULL));
+            assert(md_task_registry_signal_origin(r,&info,&origin) && origin.uid==2000 && !origin.count);
+            md_identity_release(&id);
+        } else {
+            allocation_budget=0; md_task_registry_collect(r,retired_gone); allocation_budget=-1;
+            assert(!md_task_registry_signal_origin(r,&info,&origin));
+        }
+        assert(!md_task_registry_has_retired(r)); md_task_registry_destroy(r);
+    }
+    assert(!md_user_namespace_set_limit(NULL,MD_USER_NAMESPACES,limit));
+    puts("PASS reaped sender: released namespace quotas, unpinned PID values, proc/credential retirement, allocation failure and PID reuse");
+}
 void test_task_registry_exit(void) {
     unsigned before=descriptors();
     struct md_task_registry *registry=md_task_registry_create(); assert(registry);
@@ -71,7 +127,7 @@ void test_task_registry_exit(void) {
     assert(md_task_registry_read(registry,20003,0,&retained)==-ENOMEM && !retained.owner);
     assert(!md_task_registry_credentials(registry,20003,&observed));
     assert(observed.group==20003 && !observed.retired && observed.identity.uid.effective==2000);
-    md_identity_release(&observed.identity);
+    md_task_credentials_release(&observed);
     allocation_budget=-1;
     assert(!md_task_registry_read(registry,20003,0,&retained));
     allocation_budget=0;
@@ -83,7 +139,7 @@ void test_task_registry_exit(void) {
     struct md_cgroup_member *member=resources.cgroup;
     allocation_budget=0;
     assert(md_pid_identity_exit(pid));
-    md_task_registry_retire(registry,20003,&id);
+    md_task_registry_retire(registry,20003,0,&id);
     md_task_registry_forget(registry,20003);
     struct md_task_snapshot live;
     assert(md_task_registry_read(registry,20003,0,&live)==-ESRCH);
@@ -93,7 +149,7 @@ void test_task_registry_exit(void) {
     assert(retired.pid==pid && retired.cgroup==member);
     assert(!md_task_registry_credentials(registry,20003,&observed));
     assert(observed.group==20003 && observed.retired && observed.identity.uid.effective==1234);
-    md_identity_release(&observed.identity);
+    md_task_credentials_release(&observed);
     assert(retained.identity.uid.effective==2000 && retained.files==resources.files);
     md_task_snapshot_release(&retained);
     assert(!md_resources_release(&resources));
@@ -117,7 +173,7 @@ void test_task_registry_exit(void) {
     id=md_identity_new(2000,2000);
     assert(!md_resources_init(&resources,NULL));
     assert(!md_task_registry_publish(registry,20003,20003,&id,&resources));
-    md_task_registry_retire(registry,20003,&id);
+    md_task_registry_retire(registry,20003,0,&id);
     assert(md_task_registry_retired(registry,20003).identity);
     assert(!md_task_registry_publish(registry,20003,20003,&id,&resources));
     assert(!md_task_registry_has_retired(registry));
@@ -126,6 +182,7 @@ void test_task_registry_exit(void) {
     assert(md_task_registry_probe(registry,20003,0,&live)==-ESRCH);
     assert(!md_resources_release(&resources)); md_identity_release(&id);
     md_task_registry_destroy(registry);
+    task_reaped_sender();
     assert(descriptors()==before);
     puts("PASS task exit: retained identity/cgroup, no live authority, allocation-free retirement/reaping");
 }
@@ -268,6 +325,21 @@ static void native_io_proofs(struct md_mount_namespace *view,struct md_fs_anchor
     assert(!md_fd_origins_native(&turn,10,&native));
     assert(!md_fd_origins_native_regular(&turn,10));
     assert(!md_fd_origins_close_untracked(&turn,10));
+    struct md_identity identity=md_identity_new(0,0);
+    struct md_fd_object *pipe=md_descriptor_inode_new(&identity,S_IFIFO|0600); assert(pipe);
+    assert(!md_fd_origins_prepare_object(files,pipe,0,&update));
+    md_fd_origins_finish(&update,12);
+    allocation_budget=0;
+    assert(md_fd_origins_native_io(&turn,8) && md_fd_origins_native_io(&turn,12));
+    assert(!md_fd_origins_native_io(&turn,9) && !md_fd_origins_native_io(&turn,10));
+    assert(!md_fd_origins_native_io(&turn,-1));
+    allocation_budget=-1;
+    assert(!md_fd_origins_prepare_copy(files,12,0,&update));
+    md_fd_origins_finish(&update,13);
+    assert(md_fd_origins_native_io(&turn,13));
+    assert(!md_fd_origins_abandon_range(files,12,12));
+    assert(!md_fd_origins_native_io(&turn,12));
+    md_fd_object_release(pipe); md_identity_release(&identity);
     struct md_fd_loan *loan=md_fd_loan_new(files); assert(loan);
     assert(!md_fd_origins_prepare(files,file,0,&update));
     assert(!md_fd_origins_prepare_custody(&update,loan,&turn));
@@ -407,7 +479,7 @@ static void ownership(struct md_fs_anchor *a, struct md_fs_anchor *b) {
         assert(!md_resources_unshare_prepare(&child,CLONE_FILES,NULL,&change));
         assert(!md_resources_unshare_finish(&child,NULL,&change,-EINVAL));
         assert(child.files==old);
-        assert(!md_resources_exec(&child));
+        assert(!md_resources_exec(&child,NULL));
         assert(child.files!=parent.files);
         expect(child.files,10,b,0); expect(child.files,71,NULL,0);
         expect(parent.files,71,b,FD_CLOEXEC);
@@ -671,6 +743,21 @@ static void mutations(struct md_fs_anchor *a, struct md_fs_anchor *b) {
     assert(!md_fd_mutation_finish(&op,files,-EPERM)); expect(files,10,a,0);
     assert(!md_fd_mutation_prepare(files,SYS_fcntl,args,&op));
     assert(!md_fd_mutation_finish(&op,files,0)); expect(files,10,a,FD_CLOEXEC);
+    const unsigned commands[]={FIONCLEX,FIOCLEX};
+    for (unsigned i=0;i<2;++i) {
+        args[1]=(1UL<<32)|commands[i]; args[2]=~0UL;
+        assert(!md_fd_mutation_prepare(files,SYS_ioctl,args,&op));
+        assert(!md_fd_mutation_finish(&op,files,-EPERM)); expect(files,10,a,i ? 0 : FD_CLOEXEC);
+        assert(!md_fd_mutation_prepare(files,SYS_ioctl,args,&op));
+        allocation_budget=0;
+        assert(!md_fd_mutation_finish(&op,files,0)); expect(files,10,a,i ? FD_CLOEXEC : 0);
+        allocation_budget=-1;
+        put(files,13,b,FD_CLOEXEC);
+        args[0]=13;
+        assert(!md_fd_mutation_prepare(files,SYS_ioctl,args,&op));
+        assert(!md_fd_mutation_abandon(&op,files)); expect(files,13,NULL,0);
+        args[0]=10;
+    }
     assert(!md_fd_mutation_prepare(files,SYS_close,args,&op));
     assert(!md_fd_mutation_finish(&op,files,-EPERM)); expect(files,10,a,FD_CLOEXEC);
     assert(!md_fd_mutation_prepare(files,SYS_close,args,&op));
@@ -1661,6 +1748,13 @@ static void native_loans(void) {
         md_fd_origins_finish(&update,result ? result : 14);
         if (!result) {
             assert(md_fd_origins_loan_matches(&turn,14,loan)==1);
+            unsigned long args[6]={14,(1UL<<32)|FIOCLEX,~0UL};
+            struct md_fd_loan *held=NULL; int selected=-1;
+            assert(!md_fd_mutation_loan(&turn,SYS_ioctl,args,&selected,&held) && !held);
+            args[1]=(1UL<<32)|FIONCLEX;
+            assert(md_fd_mutation_loan(&turn,SYS_ioctl,args,&selected,&held)==1);
+            assert(selected==14 && held==loan);
+            md_fd_loan_release(held);
             md_fd_loan_end(loan);
             int number=-1;
             assert(md_fd_origins_loan_next(&turn,&number)==1 && number==14);
@@ -1676,7 +1770,7 @@ static void native_input_pin(void) {
     unsigned pin_before=descriptors();
     int pipe_fds[2];
     assert(!pipe2(pipe_fds,O_NONBLOCK|O_CLOEXEC));
-    struct md_fd_object *pin=md_fd_native_pin_new(pipe_fds[1]);
+    struct md_fd_object *pin=md_fd_native_pin_new(pipe_fds[1],NULL);
     assert(pin);
     struct stat pinned, original;
     assert(!fstat(pipe_fds[1],&original));
@@ -1688,9 +1782,32 @@ static void native_input_pin(void) {
     assert(read(pipe_fds[0],&byte,1)==0);
     md_fd_object_release(pin);
     allocation_budget=0;
-    assert(!md_fd_native_pin_new(pipe_fds[0]) && errno==ENOMEM);
+    assert(!md_fd_native_pin_new(pipe_fds[0],NULL) && errno==ENOMEM);
     allocation_budget=-1;
     close(pipe_fds[0]);
+    assert(!pipe2(pipe_fds,O_NONBLOCK|O_CLOEXEC));
+    struct md_identity root=md_identity_new(0,0);
+    pin=md_fd_native_pin_new(pipe_fds[1],&root);
+    assert(pin && md_descriptor_inode_is(pin));
+    assert(!fstat(pipe_fds[1],&original));
+    assert(!md_descriptor_inode_chown(pin,&root,71,72));
+    assert(!md_descriptor_inode_chmod(pin,&root,0640));
+    assert(!fstat(md_fd_native_pin_descriptor(pin),&pinned));
+    assert(pinned.st_uid==original.st_uid && pinned.st_gid==original.st_gid && pinned.st_mode==original.st_mode);
+    assert(!md_descriptor_inode_stat(pin,&root,&pinned));
+    assert(pinned.st_uid==71 && pinned.st_gid==72 && pinned.st_mode==(S_IFIFO|0640));
+    close(pipe_fds[1]);
+    assert(read(pipe_fds[0],&byte,1)==0);
+    md_fd_object_release(pin); close(pipe_fds[0]);
+    for (int budget=0;budget<2;++budget) {
+        assert(!pipe2(pipe_fds,O_NONBLOCK|O_CLOEXEC));
+        allocation_budget=budget;
+        pin=md_fd_native_pin_new(pipe_fds[1],&root);
+        allocation_budget=-1;
+        if (pin) md_fd_object_release(pin); else assert(errno==ENOMEM);
+        close(pipe_fds[0]); close(pipe_fds[1]);
+    }
+    md_identity_release(&root);
     assert(descriptors()==pin_before);
 }
 void test_fd_origins(void) {

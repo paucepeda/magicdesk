@@ -7,6 +7,7 @@ import shlex
 import subprocess
 
 from benchmark_cpu import observe_suite_cpu
+from fixture_executor import FixtureExecutor
 from init_fixture import prepare_init
 from test_oci_services import Suite, add_machine_entry_argument
 
@@ -90,12 +91,13 @@ def main():
     parser.add_argument('--app-launches', type=int, choices=range(1, 11), default=1,
                         help='Run Firefox repeatedly with a fresh profile and verify every rendered image')
     add_machine_entry_argument(parser)
+    FixtureExecutor.add_argument(parser)
     args = parser.parse_args()
     if args.snap == 'chromium' and not args.namespace_only:
         parser.error('--snap chromium requires --namespace-only; GUI coverage uses the desktop fixture')
     if args.namespace_only:
         args.cold_launch_checks = max(1, args.cold_launch_checks)
-    suite = Suite(args.output, args.build, machine_entry=args.machine_entry)
+    suite = Suite(args.output, args.build, machine_entry=args.machine_entry, executor=args.executor)
     suite.report['store'] = args.store
     suite.report['snap'] = args.snap
     suite.report['diagnostics'] = dict(debug=args.debug, statistics=args.statistics,
@@ -155,7 +157,7 @@ for attempt in range(count):
         start = time.monotonic()
         command = ['snap', 'run', '--shell', name, '-c', 'true']
         if @TRACE@:
-            command = ['strace', '-f', '-ttt', '-s', '256', '-o',
+            command = ['strace', '-f', '-ttt', '-T', '-s', '256', '-o',
                        str(directory / ('cold-trace-%d.log' % attempt)), '-e',
                        'trace=%file,mount,unshare,setns,pivot_root', *command]
         result = subprocess.run(command,
@@ -222,14 +224,14 @@ PY'''.replace('@SNAP@', args.snap).replace('@COUNT@', str(args.cold_launch_check
             suite.report['screenshots'] = []
             for attempt in range(args.app_launches):
                 screenshot = args.output / (suite.report['id'] + '-firefox-%d.png' % attempt)
-                suite.transport.download(suite.client, suite.base + '/render-%d.png' % attempt,
+                suite.download(suite.base + '/render-%d.png' % attempt,
                                          screenshot, overwrite=True)
                 pixel = subprocess.check_output(['magick', str(screenshot), '-crop', '1x1+160+120',
                                                  '-depth', '8', 'rgb:-'])
                 assert pixel == bytes([51, 153, 77]), 'Firefox screenshot did not render the requested page'
                 suite.report['screenshots'].append(str(screenshot))
             application_log = args.output / (suite.report['id'] + '-snap.log')
-            suite.transport.download(suite.client, suite.base + '/snap.log', application_log,
+            suite.download(suite.base + '/snap.log', application_log,
                                      overwrite=True)
             suite.report['applicationLog'] = str(application_log)
             failures = [line for line in application_log.read_text(errors='replace').splitlines()
@@ -246,17 +248,21 @@ PY'''.replace('@SNAP@', args.snap).replace('@COUNT@', str(args.cold_launch_check
         suite.report['passed'] = True
     finally:
         try:
-            if args.profile:
-                profile = args.output / (suite.report['id'] + '-perf.data')
-                suite.transport.download(suite.client, suite.base + '/perf.data', profile, overwrite=True)
-                suite.report['profile'] = str(profile)
             for name in ('snap.log', 'daemon.log', 'journal.log', 'trace.log', 'daemon-trace.log',
                          'sandbox-features.log', 'apparmor.log', 'cold-launch.json', 'result',
+                         *(('perf.data',) if args.profile else ()),
                          *('app-%d.trace' % i for i in range(args.app_launches) if args.trace_app),
                          *('cold-trace-%d.log' % i for i in range(args.cold_launch_checks) if args.trace_cold),
                          *('cold-launch-%d.log' % i for i in range(args.cold_launch_checks))):
-                suite.command(['/system/bin/sh', '-c', 'test ! -f "$1" || tail -100 "$1"',
-                               'snap-log', suite.base + '/' + name])
+                remote = suite.base + '/' + name
+                exists = suite.command(['/system/bin/sh', '-c', 'test ! -f "$1" || printf yes',
+                                        'snap-log', remote], quiet=True)
+                if exists == 'yes':
+                    local = args.output / (suite.report['id'] + '-' + name)
+                    suite.download(remote, local, overwrite=True)
+                    suite.report.setdefault('artifacts', {})[name] = str(local)
+                    if name == 'perf.data':
+                        suite.report['profile'] = str(local)
         finally:
             try:
                 if created:

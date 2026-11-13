@@ -185,6 +185,18 @@ static void ports(void) {
     assert(!md_network_flow_route(a.gateway,&packet,0,0,&path));
     assert(path.steps[0].hook==NF_INET_LOCAL_OUT && path.destination==a.space->inode
         && packet.destination.v4==htonl(0x0a580002) && packet.destination_port==htons(80));
+    const uint32_t sources[]={0x7f000001,0x7f020304,0xc0000201};
+    for (unsigned i=0;i<sizeof(sources)/sizeof(*sources);++i) {
+        packet=(struct md_filter_packet){.source=md_ip_v4(htonl(sources[i])),.source_port=htons(40000),
+            .destination=md_ip_loopback(AF_INET),.destination_port=htons(number),.protocol=6,.state=8};
+        assert(!md_network_flow_route(a.gateway,&packet,i==2,0,&path));
+        assert(packet.source.v4==htonl(i==2 ? sources[i] : 0x0a580001));
+        assert(path.original.source.v4==htonl(sources[i]));
+        struct md_network_interface *reverse=md_network_route_find(a.space,packet.source,NULL);
+        assert(reverse && !strcmp(reverse->info.name,"eth0"));
+        assert(!md_network_flow_check(a.space->fabric,&path,0));
+        assert(!md_network_flow_check(a.space->fabric,&path,1));
+    }
     unsigned char bytes[4096]={0};
     struct md_network_message output={.data=bytes,.capacity=sizeof(bytes),.size=NLMSG_HDRLEN,.message=(void *)bytes};
     struct md_filter_rule *rule=&a.gateway->filter->rules[0];
@@ -457,7 +469,7 @@ static void reject_admission(void) {
         struct md_fd_object *endpoint; int fd;
         assert(!md_network_endpoint_open(n,0,target.ip.family,tcp ? SOCK_STREAM : SOCK_DGRAM,0,&endpoint,&fd));
         assert(!md_network_endpoint_autobind(endpoint,fd,&root,(void *)&wire,size,0));
-        const int errors[]={-ENETUNREACH,-ECONNREFUSED,-EHOSTUNREACH,-EACCES};
+        const int errors[]={-ENETUNREACH,-ECONNREFUSED,-EHOSTUNREACH,ipv6 ? -EACCES : -EHOSTUNREACH};
         for(unsigned code=0;code<4;++code) {
             pthread_mutex_lock(&n->fabric->lock);
             n->filter=&filter; rule.expressions[0].aux=code; md_network_forward_changed(n->fabric);

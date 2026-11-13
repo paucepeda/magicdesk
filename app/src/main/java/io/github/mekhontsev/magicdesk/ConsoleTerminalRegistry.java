@@ -92,8 +92,10 @@ final class ConsoleTerminalRegistry {
     static Snapshot mostRecent() {
         return callOnMain(() -> {
             synchronized (ENTRIES) {
+                pruneLocked();
                 Entry selected = null;
                 for (final Entry entry : ENTRIES.values()) {
+                    if (entry.lastFocusSequence == 0) continue;
                     if (selected == null || entry.lastFocusSequence >= selected.lastFocusSequence) {
                         selected = entry;
                     }
@@ -119,7 +121,7 @@ final class ConsoleTerminalRegistry {
             disconnectClient = activity.isFinishing() && !entry.tmuxSessionId.isEmpty();
             ENTRIES.notifyAll();
         }
-        if (disconnectClient) { close(id); return; }
+        if (disconnectClient) { close(id, "window-closed"); return; }
         DesktopAutomationEventJournal.record("terminal", "detached", true, "terminalId=" + id);
         MagicDeskRuntime.refreshNotification();
     }
@@ -411,6 +413,10 @@ final class ConsoleTerminalRegistry {
     }
 
     static boolean close(final String id) {
+        return close(id, "requested");
+    }
+
+    private static boolean close(final String id, final String reason) {
         return callOnMain(() -> {
             final Entry entry;
             synchronized (ENTRIES) {
@@ -418,10 +424,10 @@ final class ConsoleTerminalRegistry {
                 ENTRIES.notifyAll();
             }
             if (entry == null) { return false; }
+            entry.recordLifecycle("closed", true, reason);
             entry.window.release();
             entry.session.close();
             entry.notifications.close();
-            DesktopAutomationEventJournal.record("terminal", "closed", true, "terminalId=" + id);
             MagicDeskRuntime.refreshNotification();
             return true;
         });
@@ -431,7 +437,7 @@ final class ConsoleTerminalRegistry {
         callOnMain(() -> {
             final List<String> ids;
             synchronized (ENTRIES) { ids = new ArrayList<>(ENTRIES.keySet()); }
-            for (final String id : ids) { close(id); }
+            for (final String id : ids) { close(id, "runtime-stopped"); }
             return null;
         });
     }
@@ -442,7 +448,7 @@ final class ConsoleTerminalRegistry {
             if (entry == null) { return false; }
             final Activity activity = entry.window.owner();
             if (!entry.tmuxSessionId.isEmpty()) {
-                close(id);
+                close(id, "client-detached");
                 if (activity != null && !activity.isDestroyed()) activity.finishAndRemoveTask();
                 return true;
             }
@@ -581,10 +587,22 @@ final class ConsoleTerminalRegistry {
             window.notifyListener(action);
         }
 
+        private void recordLifecycle(String operation, boolean success, String reason) {
+            DesktopAutomationEventJournal.record("terminal", operation, success,
+                    "terminalId=" + id + " backend=" + session.backend().wireName
+                            + " " + session.diagnosticIdentity()
+                            + " tmuxSessionId=" + (tmuxSessionId.isEmpty() ? "none" : tmuxSessionId)
+                            + " reason=" + reason);
+        }
+
         @Override public void onScreenChanged() { notifyView(ConsoleTerminalSession.Listener::onScreenChanged); }
-        @Override public void onReady() { notifyView(ConsoleTerminalSession.Listener::onReady); }
-        @Override public void onFinished() { ConsoleTerminalRegistry.close(id); }
+        @Override public void onReady() {
+            recordLifecycle("ready", true, "pty-connected");
+            notifyView(ConsoleTerminalSession.Listener::onReady);
+        }
+        @Override public void onFinished() { ConsoleTerminalRegistry.close(id, "transport-eof"); }
         @Override public void onError(final IOException error) {
+            recordLifecycle("error", false, ShellAccess.usefulMessage(error));
             session.appendLocalMessage(ShellAccess.usefulMessage(error));
             notifyView(listener -> listener.onError(error));
         }

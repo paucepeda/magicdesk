@@ -4,6 +4,7 @@
 #include "task_status.h"
 #include "mqueue_view.h"
 #include <assert.h>
+#include "uts_view.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -25,15 +26,118 @@ void test_user_namespace(void);
 void test_control_poll(void);
 void test_descriptor_inode(void);
 void test_ipc_database(void);
+struct uts_reader {
+    struct md_uts_view view;
+    atomic_int done;
+    atomic_uint reads;
+};
+static void *uts_read_concurrent(void *opaque) {
+    struct uts_reader *reader=opaque;
+    do {
+        struct utsname names;
+        if (!md_uts_view_read(&reader->view,&names)) continue;
+        assert(names.nodename[0]=='a' || names.nodename[0]=='b');
+        for (unsigned i=1;i<sizeof(names.nodename)-1;++i)
+            assert(names.nodename[i]==names.nodename[0]);
+        assert(!names.nodename[sizeof(names.nodename)-1]);
+        atomic_fetch_add(&reader->reads,1);
+    } while (!atomic_load(&reader->done));
+    return NULL;
+}
+static void uts_publication(void) {
+    struct md_uts_namespace *ns=md_uts_namespace_new(); assert(ns);
+    struct uts_reader reader={0}; struct md_uts_subscription subscription={0};
+    char name[sizeof(((struct utsname *)0)->nodename)-1]; memset(name,'a',sizeof(name));
+    assert(!md_uts_namespace_set(ns,0,name,sizeof(name)));
+    md_uts_namespace_subscribe(ns,&subscription,&reader.view);
+    pthread_t thread; assert(!pthread_create(&thread,NULL,uts_read_concurrent,&reader));
+    for (unsigned i=0;i<10000;++i) {
+        memset(name,i&1 ? 'a' : 'b',sizeof(name));
+        assert(!md_uts_namespace_set(ns,0,name,sizeof(name)));
+    }
+    atomic_store(&reader.done,1); assert(!pthread_join(thread,NULL) && atomic_load(&reader.reads));
+    md_uts_namespace_unsubscribe(&subscription); md_uts_namespace_release(ns);
+    puts("PASS UTS publication: concurrent atomic snapshots never mix namespace generations");
+}
+static void process_access(void) {
+    assert(md_resources_setns_process_flags(0)==-EINVAL);
+    assert(md_resources_setns_process_flags(CLONE_FILES)==-EINVAL);
+    assert(md_resources_setns_process_flags(CLONE_NEWTIME)==-EOPNOTSUPP);
+    assert(!md_resources_setns_process_flags(CLONE_NEWUSER|CLONE_NEWNET));
+    struct md_task_resources parent={0},peer={0},child={0};
+    assert(!md_resources_init(&parent,NULL));
+    assert(md_process_dumpable(parent.access)==1);
+    assert(!md_resources_fork(&parent,CLONE_VM,NULL,&peer));
+    assert(peer.access==parent.access && !md_process_set_dumpable(peer.access,0));
+    assert(!md_process_dumpable(parent.access));
+    assert(!md_resources_fork(&parent,0,NULL,&child));
+    assert(child.access!=parent.access && !md_process_dumpable(child.access));
+    assert(!md_process_set_dumpable(child.access,1) && !md_process_dumpable(parent.access));
+    assert(md_process_set_dumpable(parent.access,2)==-EINVAL && !md_process_dumpable(parent.access));
+    struct md_identity user=md_identity_new(1000,1000),root=md_identity_new(0,0);
+    assert(md_process_may_inspect(&user,&user,0,child.access));
+    assert(!md_process_may_inspect(&user,&user,0,parent.access));
+    assert(md_process_may_inspect(&root,&user,0,parent.access));
+    struct md_identity nested=md_identity_copy(&user);
+    assert(!md_identity_enter_user_namespace(&nested));
+    assert(!md_process_may_inspect(&nested,&nested,0,parent.access));
+    struct md_process_access *nested_mm=md_process_access_new(nested.user_namespace); assert(nested_mm);
+    assert(!md_process_set_dumpable(nested_mm,0));
+    assert(md_process_may_inspect(&nested,&nested,0,nested_mm));
+    assert(!md_process_set_dumpable(child.access,1));
+    md_process_access_credentials(child.access,&user,&nested);
+    assert(md_process_dumpable(child.access)==1);
+    uint32_t uid,gid;
+    md_process_file_owner(&nested,parent.access,S_IFDIR|0555,getuid(),&uid,&gid);
+    assert(uid==1000 && gid==1000);
+    md_process_file_owner(&nested,parent.access,S_IFDIR|0511,getuid(),&uid,&gid);
+    assert(!uid && !gid);
+    md_process_access_release(nested_mm); md_identity_release(&nested);
+    struct md_task_registry *registry=md_task_registry_create(); assert(registry);
+    assert(!md_task_registry_publish(registry,123,123,&user,&parent));
+    struct md_task_snapshot snapshot;
+    assert(!md_task_registry_read(registry,123,0,&snapshot));
+    assert(snapshot.access==parent.access);
+    assert(!md_process_set_dumpable(peer.access,1) && md_process_dumpable(snapshot.access)==1);
+    struct md_identity next=user; ++next.uid.fs;
+    assert(!md_task_registry_publish(registry,123,123,&next,&parent));
+    assert(!md_process_dumpable(snapshot.access));
+    struct md_resource_change change;
+    assert(!md_resources_exec_prepare(&parent,NULL,&change));
+    assert(change.next.access!=parent.access && md_process_dumpable(change.next.access)==1);
+    assert(!md_resources_unshare_finish(&parent,NULL,&change,-ENOEXEC));
+    assert(parent.access==peer.access && !md_process_dumpable(parent.access));
+    assert(!md_resources_exec_prepare(&parent,NULL,&change));
+    assert(!md_resources_unshare_finish(&parent,NULL,&change,0));
+    assert(parent.access!=peer.access && md_process_dumpable(parent.access)==1);
+    assert(!md_process_dumpable(snapshot.access));
+    assert(!md_resources_exec(&parent,NULL) && md_process_dumpable(parent.access)==1);
+    assert(!md_process_dumpable(peer.access) && !md_process_dumpable(snapshot.access));
+    md_task_snapshot_release(&snapshot); md_task_registry_destroy(registry);
+    assert(!md_resources_release(&parent) && !md_resources_release(&peer) && !md_resources_release(&child));
+    md_identity_release(&user); md_identity_release(&root);
+    puts("PASS mm access: shared threads, private fork/exec, credential commits and retained snapshots");
+}
 static int descriptors(void) {
     DIR *dir = opendir("/proc/self/fd"); assert(dir);
     int count = 0;
     while (readdir(dir)) count++;
     closedir(dir); return count;
 }
+static void status_signal_handler(int signal) { (void)signal; }
+static void signal_dispositions(void) {
+    struct sigaction handled={.sa_handler=status_signal_handler},ignored={.sa_handler=SIG_IGN},saved[2];
+    sigemptyset(&handled.sa_mask); sigemptyset(&ignored.sa_mask);
+    assert(!sigaction(SIGUSR1,&handled,&saved[0]) && !sigaction(SIGUSR2,&ignored,&saved[1]));
+    uint64_t caught=0,ign=0,first=UINT64_C(1)<<(SIGUSR1-1),second=UINT64_C(1)<<(SIGUSR2-1);
+    assert(!md_task_signal_dispositions((int)syscall(SYS_gettid),&caught,&ign));
+    assert((caught&first) && !(caught&second) && !(ign&first) && (ign&second));
+    assert(!sigaction(SIGUSR1,&saved[0],NULL) && !sigaction(SIGUSR2,&saved[1],NULL));
+    puts("PASS task status: caught and ignored dispositions share one kernel snapshot");
+}
 static void retained_proc_query(void) {
-    int proc=open("/proc",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    int other=open("/dev",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    int proc=open("/proc",O_PATH|O_DIRECTORY|O_CLOEXEC);
+    int other=open("/dev",O_PATH|O_DIRECTORY|O_CLOEXEC);
     assert(proc>=0 && other>=0);
     const int flags[]={0,O_DIRECTORY,O_CLOEXEC,O_NOFOLLOW,O_NONBLOCK,O_LARGEFILE,O_NOCTTY,O_PATH};
     for (unsigned i=0;i<sizeof(flags)/sizeof(*flags);++i) {
@@ -196,6 +300,14 @@ static void pid_resource_transaction(void) {
     assert(!md_pid_identity_prepare(child.pid_children,&child.pid));
     assert(!md_pid_identity_publish(child.pid,20001,20001));
     child.pid_group=md_pid_identity_retain(child.pid);
+    struct md_task_registry *registry=md_task_registry_create(); assert(registry);
+    for (unsigned i=0;i<1024;++i)
+        assert(!md_task_registry_publish(registry,20001,20001,&identity,&child));
+    struct md_task_snapshot snapshot;
+    assert(!md_task_registry_read(registry,20001,0,&snapshot));
+    assert(snapshot.pid==child.pid && snapshot.pid_group==child.pid_group && snapshot.cgroup==child.cgroup);
+    md_task_snapshot_release(&snapshot);
+    md_task_registry_forget(registry,20001); md_task_registry_destroy(registry);
     assert(!md_resources_unshare_prepare(&child,CLONE_NEWPID,&identity,&change));
     assert(md_pid_namespace_parent(change.next.pid_children)==owner.pid_children);
     assert(!md_resources_unshare_finish(&child,NULL,&change,0));
@@ -222,7 +334,7 @@ static void network_resource_transaction(void) {
     assert(owner.network!=child.network && md_network_namespace_managed(owner.network));
     assert(md_network_namespace_inode(owner.network)!=md_network_namespace_inode(child.network));
     struct md_fd_object *socket=md_network_socket_new(owner.network); assert(socket);
-    assert(!md_resources_exec(&owner) && md_network_socket_offline(socket));
+    assert(!md_resources_exec(&owner,NULL) && md_network_socket_offline(socket));
     assert(!md_resources_release(&owner));
     assert(md_network_socket_offline(socket)); md_fd_object_release(socket);
     assert(!md_network_namespace_managed(child.network));
@@ -234,6 +346,16 @@ static void file_table_snapshot(void) {
     struct md_task_resources task; assert(!md_resources_init(&task,NULL));
     pid_t tid=getpid()+1234;
     assert(!md_task_registry_publish(registry,tid,tid,&id,&task));
+    assert(md_task_registry_thread_count(registry,tid)==1);
+    assert(!md_task_registry_publish(registry,tid+1,tid,&id,&task));
+    assert(md_task_registry_thread_count(registry,tid)==2);
+    assert(!md_task_registry_publish(registry,tid+1,tid,&id,&task));
+    assert(md_task_registry_thread_count(registry,tid)==2);
+    assert(!md_task_registry_publish(registry,tid+1,tid+1,&id,&task));
+    assert(md_task_registry_thread_count(registry,tid)==1);
+    assert(md_task_registry_thread_count(registry,tid+1)==1);
+    md_task_registry_forget(registry,tid+1);
+    assert(!md_task_registry_thread_count(registry,tid+1));
     struct md_task_snapshot proc;
     assert(!md_task_registry_proc(registry,tid,&proc));
     assert(proc.tid==tid && proc.pid==task.pid && proc.cgroup==task.cgroup && !proc.fs && !proc.files);
@@ -242,7 +364,8 @@ static void file_table_snapshot(void) {
     assert(md_task_registry_files(registry,tid,tid+1,&files)==-EPERM && !files);
     assert(md_task_registry_files(registry,tid+1,0,&files)==-ESRCH && !files);
     assert(!md_task_registry_files(registry,tid,tid,&files) && files==task.files);
-    md_task_registry_retire(registry,tid,&id);
+    md_task_registry_retire(registry,tid,0,&id);
+    assert(!md_task_registry_thread_count(registry,tid));
     assert(!md_task_registry_proc(registry,tid,&proc));
     assert(proc.tid==tid && !proc.fs && !proc.files);
     md_task_snapshot_release(&proc);
@@ -320,7 +443,7 @@ static void live_umask_snapshot(void) {
     long exited_mask=md_task_snapshot_umask(&second);
     if (exited_mask!=-ESRCH) fprintf(stderr,"exited task umask: %ld\n",exited_mask);
     assert(exited_mask==-ESRCH);
-    md_task_registry_retire(registry,state.tid,&id);
+    md_task_registry_retire(registry,state.tid,0,&id);
     md_task_registry_destroy(registry);
     assert(descriptors()==before+1);
     md_task_snapshot_release(&second);
@@ -378,7 +501,7 @@ static void resource_generations(void) {
         assert(!md_task_registry_publish(registry,tid,tid,&id[i%2],&task[i%2]));
     /* EVENT_WAIT: reader completes before retiring its registry identity. */
     assert(!pthread_join(thread,NULL));
-    md_task_registry_retire(registry,tid,&id[1]);
+    md_task_registry_retire(registry,tid,0,&id[1]);
     assert(md_task_registry_probe(registry,tid,0,&denied)==-ESTALE && !denied.owner);
     md_task_registry_reap(registry,tid);
     assert(!md_task_registry_publish(registry,tid,tid,&id[1],&task[1]));
@@ -394,7 +517,7 @@ static void resource_generations(void) {
     puts("PASS task generations: atomic resource/identity publication, fresh roots, reuse and retained lifetime");
 }
 static void ipc_mount_lifetime(void) {
-    char path[]="/data/local/tmp/md-mqueue-owner-XXXXXX";
+    char path[]="md-mqueue-owner-XXXXXX";
     assert(mkdtemp(path));
     int parent=open(path,O_RDONLY|O_DIRECTORY|O_CLOEXEC); assert(parent>=0);
     int before=descriptors();
@@ -448,7 +571,7 @@ static void landlock_resources(void) {
     struct md_task_snapshot snapshot;
     assert(!md_task_registry_read(registry,getpid(),0,&snapshot));
     assert(snapshot.landlock==parent.landlock);
-    assert(!md_resources_exec(&child) && child.landlock==parent.landlock);
+    assert(!md_resources_exec(&child,NULL) && child.landlock==parent.landlock);
     assert(!md_resources_release(&parent));
     md_task_registry_forget(registry,getpid()); md_task_registry_destroy(registry);
     assert(!md_resources_release(&child));
@@ -470,6 +593,8 @@ void test_network_tun(void);
 void test_task_registry_exit(void);
 void test_task_mapping(void);
 int main(int argc,char **argv) {
+    signal_dispositions();
+    uts_publication();
     alarm(60);
     if(argc==2 && !strcmp(argv[1],"--tun")) { test_network_tun(); return 0; }
     test_task_mapping();
@@ -508,6 +633,10 @@ int main(int argc,char **argv) {
     struct md_task_resources sibling;
     assert(!md_resources_fork(&r,0,NULL,&sibling) && sibling.uts==r.uts);
     assert(!md_uts_namespace_set(r.uts,0,"parent",6));
+    struct md_uts_view view={0},peer_view={0};
+    struct md_uts_subscription subscription={0},peer_subscription={0};
+    md_uts_namespace_subscribe(r.uts,&subscription,&view);
+    md_uts_namespace_subscribe(sibling.uts,&peer_subscription,&peer_view);
     assert(!md_resources_unshare_prepare(&r,CLONE_NEWUTS,&identity,&change));
     assert(change.next.uts && change.next.uts!=r.uts);
     assert(!md_resources_unshare_finish(&r,NULL,&change,-EINVAL) && r.uts==sibling.uts);
@@ -516,6 +645,16 @@ int main(int argc,char **argv) {
     struct utsname names;
     md_uts_namespace_read(r.uts,&names); assert(!strcmp(names.nodename,"parent"));
     assert(!md_uts_namespace_set(r.uts,0,"child",5));
+    assert(md_uts_view_read(&view,&names) && !strcmp(names.nodename,"parent"));
+    md_uts_namespace_subscribe(r.uts,&subscription,&view);
+    assert(md_uts_view_read(&view,&names) && !strcmp(names.nodename,"child"));
+    assert(!md_uts_namespace_set(sibling.uts,0,"sibling",7));
+    assert(md_uts_view_read(&peer_view,&names) && !strcmp(names.nodename,"sibling"));
+    assert(md_uts_view_read(&view,&names) && !strcmp(names.nodename,"child"));
+    assert(!md_uts_namespace_set(sibling.uts,0,"parent",6));
+    md_uts_namespace_unsubscribe(&subscription);
+    assert(!md_uts_view_read(&view,&names));
+    md_uts_namespace_unsubscribe(&peer_subscription);
     md_uts_namespace_read(sibling.uts,&names); assert(!strcmp(names.nodename,"parent"));
     assert(!md_resources_release(&sibling));
     assert(md_resources_clone_supported(CLONE_NEWNS));
@@ -529,6 +668,7 @@ int main(int argc,char **argv) {
     assert(!md_resources_release(&r));
     int before = descriptors();
     retained_proc_query();
+    process_access();
     file_table_snapshot();
     live_umask_snapshot();
     resource_generations();

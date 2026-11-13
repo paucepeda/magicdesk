@@ -7,6 +7,7 @@
 #include "fs_buffer.h"
 #include "fd_client.h"
 #include "signal_delivery.h"
+#include "native_probe.h"
 #include <assert.h>
 #include <elf.h>
 #include <errno.h>
@@ -40,7 +41,7 @@
 #define STRINGIFY_(n) #n
 #define STRINGIFY(n) STRINGIFY_(n)
 
-/* Isolated protocol experiment, not a second runtime implementation. */
+/* Native protocol controls, independent of the supervised runtime. */
 extern char checkpoint_brk[],checkpoint_step[],checkpoint_syscall[];
 __asm__(".text\n.balign 4\n.global checkpoint_brk\ncheckpoint_brk:\nbrk #0\n"
     ".global checkpoint_step\ncheckpoint_step:\nnop\n"
@@ -1035,8 +1036,15 @@ static long task_trace(int request,pid_t pid,void *address,void *data) {
     return ptrace(request,pid,address,data);
 }
 static int checkpoint_restricted;
+static int checkpoint_stop_instead;
 static unsigned checkpoint_register_reads,checkpoint_register_writes,checkpoint_event_reads,checkpoint_info_reads;
 static long checkpoint_trace(int request,pid_t pid,void *address,void *data) {
+    if (request==PTRACE_INTERRUPT && checkpoint_stop_instead) {
+        /* Force the kernel's competing group-stop acknowledgement. All stops,
+         * resumes, register restoration and seccomp admission remain real. */
+        checkpoint_stop_instead=0;
+        return kill(pid,SIGSTOP);
+    }
     if (request==PTRACE_GETREGSET && (uintptr_t)address==NT_PRSTATUS) ++checkpoint_register_reads;
     if (request==PTRACE_SETREGSET && (uintptr_t)address==NT_PRSTATUS) ++checkpoint_register_writes;
     if (request==PTRACE_GETEVENTMSG) ++checkpoint_event_reads;
@@ -1046,7 +1054,7 @@ static long checkpoint_trace(int request,pid_t pid,void *address,void *data) {
 static int checkpoint_policy(pid_t pid) { (void)pid; return checkpoint_restricted; }
 extern char unified_native[],md_guest_buffer_control_checkpoint[];
 __asm__(".text\n.balign 4\n.global unified_native\nunified_native:\nsvc #0\n"
-    "str x0,[x23]\nmov x8,x25\nb md_guest_buffer_control\n");
+    "str x0,[x23]\nmov x8,x25\nb md_guest_buffer_control_kernel\n");
 static int checkpoint_site(uintptr_t pc) { return pc==(uintptr_t)md_guest_buffer_control_checkpoint+4; }
 extern char entry_scalar_gate[],entry_scalar_return[],md_guest_done_checkpoint[];
 extern char md_guest_fd_control_checkpoint[];
@@ -1061,8 +1069,9 @@ static int scalar_entry(uintptr_t pc,unsigned long command) {
     if (pc==(uintptr_t)md_guest_fd_control_checkpoint+4) return md_fd_control_scalar(command);
     return checkpoint_site(pc) && (md_adapter_buffer_scalar(command) || md_fs_buffer_scalar(command));
 }
-static void scalar_checkpoint(int protected,int restricted,unsigned command,int descriptor) {
-    extern struct md_fd_observation md_guest_fd_control(unsigned,uint64_t,long,long);
+static void scalar_checkpoint(int protected,int restricted,unsigned command,int descriptor,int resident) {
+    extern struct md_fd_observation md_guest_fd_control_kernel(unsigned,uint64_t,long,long);
+    extern long md_guest_buffer_control_kernel(unsigned,unsigned long,unsigned long);
     volatile uint64_t *output=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     assert(output!=MAP_FAILED);
     int start[2]; assert(!pipe(start));
@@ -1092,13 +1101,14 @@ static void scalar_checkpoint(int protected,int restricted,unsigned command,int 
     assert(write(start[1],"s",1)==1 && stopped(pid)==SIGSTOP);
     struct user_pt_regs saved=registers(pid),gate=saved;
     gate.pc=(uintptr_t)entry_scalar_gate; gate.regs[23]=(uintptr_t)output;
-    gate.regs[21]=descriptor ? (uintptr_t)md_guest_fd_control : (uintptr_t)md_guest_buffer_control;
+    gate.regs[21]=descriptor ? (uintptr_t)md_guest_fd_control_kernel : (uintptr_t)md_guest_buffer_control_kernel;
     gate.regs[22]=command;
     checkpoint_restricted=restricted;
     struct md_task_checkpoints runtime={.trace=checkpoint_trace,.restricted=checkpoint_policy,
         .marker=scalar_site,.entry_marker=scalar_entry,.begin=1,.end=UINTPTR_MAX};
     struct iovec io={&gate,sizeof(gate)};
-    assert(!md_task_checkpoint_trace(&runtime,PTRACE_SETREGSET,pid,(void *)NT_PRSTATUS,&io));
+    if (resident) assert(!ptrace(PTRACE_SETREGSET,pid,(void *)NT_PRSTATUS,&io));
+    else assert(!md_task_checkpoint_trace(&runtime,PTRACE_SETREGSET,pid,(void *)NT_PRSTATUS,&io));
     assert(!md_task_checkpoint_trace(&runtime,PTRACE_CONT,pid,NULL,NULL));
     unsigned seen=0,stops=0; int status;
     while (seen<2) {
@@ -1127,6 +1137,8 @@ static void scalar_checkpoint(int protected,int restricted,unsigned command,int 
 }
 static int nested_task_call(pid_t,int,struct md_task_checkpoints *);
 static void unified_checkpoint(int protected,int restricted,int denied,int invalid_number,int injection) {
+    unsigned guest_cookie=invalid_number ? MD_INTERCEPT_CHECKPOINT : MD_INTERCEPT_SIGNAL;
+    _Static_assert(MD_INTERCEPT_CHECKPOINT!=MD_INTERCEPT_SIGNAL,"Distinct interception owners");
     volatile long *output=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     assert(output!=MAP_FAILED);
     int start[2],data[2]; assert(!pipe(start) && !pipe2(data,O_NONBLOCK));
@@ -1151,7 +1163,7 @@ static void unified_checkpoint(int protected,int restricted,int denied,int inval
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,UINT32_MAX,0,1),
             BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_KILL_PROCESS),
             BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_write,0,1),
-            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_TRACE|73),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_TRACE|guest_cookie),
             BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)
         };
         struct sock_fprog program={sizeof(code)/sizeof(*code),code};
@@ -1173,11 +1185,12 @@ static void unified_checkpoint(int protected,int restricted,int denied,int inval
     checkpoint_restricted=restricted;
     struct md_task_checkpoints runtime={.trace=checkpoint_trace,.restricted=checkpoint_policy,.marker=checkpoint_site,
         .begin=(uintptr_t)unified_native,.end=(uintptr_t)unified_native+16};
+    checkpoint_stop_instead=injection<-1;
     struct iovec io={&gate,sizeof(gate)};
     assert(!md_task_checkpoint_trace(&runtime,PTRACE_SETREGSET,pid,(void *)NT_PRSTATUS,&io));
     assert(!md_task_checkpoint_trace(&runtime,PTRACE_CONT,pid,NULL,NULL));
     unsigned writes=checkpoint_register_writes;
-    int status,native_stops=0;
+    int status,native_stops=0,group_stops=0;
     for (unsigned stops=0;;++stops) {
         assert(stops<16 && waitpid(pid,&status,0)==pid && WIFSTOPPED(status));
         if ((int)stops==injection) {
@@ -1190,6 +1203,17 @@ static void unified_checkpoint(int protected,int restricted,int denied,int inval
         int owned=md_task_checkpoint_event(&runtime,pid,&status);
         assert(owned>=0);
         if (owned) continue;
+        if (injection<-1 && WSTOPSIG(status)==SIGSTOP) {
+            if (!((unsigned)status>>16)) {
+                assert(!md_task_checkpoint_trace(&runtime,PTRACE_CONT,pid,NULL,(void *)(uintptr_t)SIGSTOP));
+            } else {
+                assert((unsigned)status>>16==PTRACE_EVENT_STOP && !group_stops++);
+                if (injection==-2) assert(!kill(pid,SIGCONT));
+                assert(!md_task_checkpoint_trace(&runtime,injection==-3 ? PTRACE_LISTEN : PTRACE_CONT,pid,NULL,NULL));
+                if (injection==-3) assert(!kill(pid,SIGCONT));
+            }
+            continue;
+        }
         if ((unsigned)status>>16==PTRACE_EVENT_SECCOMP) {
             assert(!denied && !native_stops++);
             assert(checkpoint_register_reads==before_registers);
@@ -1213,14 +1237,14 @@ static void unified_checkpoint(int protected,int restricted,int denied,int inval
             if (invalid_number) assert(md_task_checkpoint_trace(&runtime,PTRACE_GET_SYSCALL_INFO,
                 pid,(void *)sizeof(delivered_info),&delivered_info)==size);
             if (!invalid_number) assert(!md_task_checkpoint_trace(&runtime,PTRACE_GETREGSET,pid,(void *)NT_PRSTATUS,&io));
-            assert(cookie==73 && !memcmp(&actual,&delivered,sizeof(actual)));
+            assert(cookie==guest_cookie && !memcmp(&actual,&delivered,sizeof(actual)));
             assert(!memcmp(&actual_info,&delivered_info,sizeof(actual_info)) && checkpoint_info_reads==infos+protected);
             assert(checkpoint_register_reads==reads+1 && checkpoint_event_reads==events+protected);
             assert(md_task_checkpoint_trace(&runtime,PTRACE_GET_SYSCALL_INFO,
                 pid,(void *)sizeof(delivered_info),&delivered_info)==size);
             assert(checkpoint_info_reads==infos+protected+1);
             assert(!md_task_checkpoint_trace(&runtime,PTRACE_GETEVENTMSG,pid,NULL,&cookie));
-            assert(cookie==73 && checkpoint_event_reads==events+protected+1);
+            assert(cookie==guest_cookie && checkpoint_event_reads==events+protected+1);
             assert(!md_task_checkpoint_trace(&runtime,PTRACE_GETREGSET,pid,(void *)NT_PRSTATUS,&io));
             assert(checkpoint_register_reads==reads+2 && !memcmp(&actual,&delivered,sizeof(actual)));
             assert(!md_task_checkpoint_trace(&runtime,PTRACE_CONT,pid,NULL,NULL));
@@ -1229,6 +1253,7 @@ static void unified_checkpoint(int protected,int restricted,int denied,int inval
         assert((unsigned)status>>16==MD_TASK_CHECKPOINT_EVENT); break;
     }
     assert(native_stops==!denied);
+    assert(!checkpoint_stop_instead && group_stops==(injection<-1));
     struct user_pt_regs observed=registers(pid);
     assert(observed.pc==(uintptr_t)md_guest_buffer_control_checkpoint+4 && observed.regs[7]==saved.regs[7]);
     /* Only replay of the native call needs a register write, never the marker. */
@@ -1267,7 +1292,13 @@ static void unified_checkpoint(int protected,int restricted,int denied,int inval
     io=(struct iovec){&saved,sizeof(saved)};
     assert(!md_task_checkpoint_trace(&runtime,PTRACE_SETREGSET,pid,(void *)NT_PRSTATUS,&io));
     assert(!md_task_checkpoint_trace(&runtime,PTRACE_CONT,pid,NULL,NULL));
-    assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && !WEXITSTATUS(status));
+    assert(waitpid(pid,&status,0)==pid);
+    if (injection<-1 && WIFSTOPPED(status)) {
+        assert(!((unsigned)status>>16) && WSTOPSIG(status)==SIGCONT);
+        assert(!md_task_checkpoint_trace(&runtime,PTRACE_CONT,pid,NULL,(void *)(uintptr_t)SIGCONT));
+        assert(waitpid(pid,&status,0)==pid);
+    }
+    assert(WIFEXITED(status) && !WEXITSTATUS(status));
     assert(!md_task_checkpoint_event(&runtime,pid,&status));
     md_task_checkpoints_clear(&runtime); assert(!runtime.count);
     assert(!munmap((void *)output,4096)); close(start[0]); close(start[1]); close(data[0]); close(data[1]);
@@ -1320,6 +1351,65 @@ static int nested_task_call(pid_t pid,int expect_rejected,struct md_task_checkpo
     borrowed_checkpoint=NULL;
     return 0;
 }
+static unsigned borrowed_boundary;
+static long borrowing_trace(int request,pid_t pid,void *address,void *data) {
+    (void)pid; (void)address;
+    if (request==PTRACE_GET_SYSCALL_INFO) {
+        ((struct ptrace_syscall_info *)data)->op=borrowed_boundary;
+        return sizeof(struct ptrace_syscall_info);
+    }
+    assert(request==PTRACE_SYSEMU || request==PTRACE_CONT);
+    return 0;
+}
+static void borrowing_boundaries(void) {
+    struct md_task_checkpoints runtime={.trace=borrowing_trace};
+    assert(!md_task_checkpoint_trace(&runtime,PTRACE_SYSEMU,1,NULL,NULL));
+    for (unsigned boundary=0;boundary<=PTRACE_SYSCALL_INFO_SECCOMP;++boundary) {
+        borrowed_boundary=boundary;
+        assert(md_task_checkpoint_suspend(&runtime,1)==(boundary==PTRACE_SYSCALL_INFO_ENTRY));
+        assert(md_task_checkpoint_suspend(&runtime,1)==-EBUSY);
+        md_task_checkpoint_restore(&runtime,1);
+    }
+    assert(!md_task_checkpoint_trace(&runtime,PTRACE_CONT,1,NULL,NULL));
+    borrowed_boundary=PTRACE_SYSCALL_INFO_ENTRY;
+    assert(!md_task_checkpoint_suspend(&runtime,1));
+    md_task_checkpoint_restore(&runtime,1);
+    md_task_checkpoints_clear(&runtime);
+}
+static void caller_checkpoint(int protected) {
+    struct report *out=mmap(NULL,sizeof(*out),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    assert(out!=MAP_FAILED);
+    pid_t pid=fork(); assert(pid>=0);
+    if (!pid) child(FILTER|DENY_SKIP|BLOCK|(protected ? PROTECTED : 0),out);
+    assert(stopped(pid)==SIGSTOP);
+    assert(!ptrace(PTRACE_SETOPTIONS,pid,NULL,
+        (void *)(PTRACE_O_TRACESYSGOOD|PTRACE_O_TRACESECCOMP|PTRACE_O_EXITKILL)));
+    struct user_pt_regs saved=registers(pid),gate=saved;
+    gate.pc=(uintptr_t)checkpoint_syscall; gate.regs[8]=SYS_getpgid; gate.regs[0]=0x10900;
+    set_registers(pid,&gate);
+    struct md_task_checkpoints runtime={.trace=task_trace,.restricted=checkpoint_policy,.marker=checkpoint_site};
+    assert(!md_task_checkpoint_trace(&runtime,PTRACE_SYSEMU,pid,NULL,NULL));
+    int status;
+    assert(waitpid(pid,&status,0)==pid && WSTOPSIG(status)==(SIGTRAP|0x80));
+    assert(!md_task_checkpoint_event(&runtime,pid,&status));
+    assert((unsigned)status>>16==0);
+    gate=registers(pid);
+    /* Updating registers cannot turn an already skipped entry into a native
+     * entry. The borrower must retain that fact independently of decoding. */
+    struct iovec io={&gate,sizeof(gate)};
+    assert(!md_task_checkpoint_trace(&runtime,PTRACE_SETREGSET,pid,(void *)NT_PRSTATUS,&io));
+    assert(!nested_task_call(pid,0,&runtime));
+    struct user_pt_regs restored=registers(pid);
+    assert(!memcmp(&restored,&gate,sizeof(gate)));
+    io=(struct iovec){&saved,sizeof(saved)};
+    assert(!md_task_checkpoint_trace(&runtime,PTRACE_SETREGSET,pid,(void *)NT_PRSTATUS,&io));
+    assert(!md_task_checkpoint_trace(&runtime,PTRACE_CONT,pid,NULL,NULL));
+    assert(waitpid(pid,&status,0)==pid && WIFEXITED(status) && !WEXITSTATUS(status));
+    assert(!md_task_checkpoint_event(&runtime,pid,&status));
+    md_task_checkpoints_clear(&runtime);
+    assert(out->progress==1 && !out->changed && !out->mask_changed);
+    assert(!munmap(out,sizeof(*out)));
+}
 static void chained_native_replay(int protected,int restart,int writing,int boundary,int disposition,int pending,int injected,int interposed) {
     struct replay_observation *out=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     char *alternate=mmap(NULL,65536,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
@@ -1361,7 +1451,8 @@ static void chained_native_replay(int protected,int restart,int writing,int boun
         }
         assert(!syscall(SYS_kill,syscall(SYS_getpid),SIGSTOP));
         byte='q';
-        long result=replay_original(number,data[writing ? 1 : 0],&byte,&out->x7);
+        long result=replay_original(number | (injected ? UINT64_C(0x123400000000) : 0),
+            data[writing ? 1 : 0],&byte,&out->x7);
         assert(result==(reads ? 1 : -EINTR) && byte=='q' && out->x7==0x4321);
         assert(out->signal[0].count==(disposition==3 ? 0 : 1));
         assert(out->signal[1].count==(disposition==0 ? 1 : 0));
@@ -1722,7 +1813,7 @@ static void birth_terminal_race(int kind,int protected,int code) {
         } else if (pid==actor && (unsigned)status>>16==event) {
             assert(!ptrace(PTRACE_GETEVENTMSG,pid,NULL,&newborn) && newborn>0);
             int terminal=-1;
-            assert(md_task_birth_read(task_trace,actor,event,SYS_clone,&terminal)==(long)newborn && !terminal);
+            assert(md_task_birth_read(task_trace,actor,event,&terminal)==(long)newborn && !terminal);
             break;
         }
         if (pid==child || pid==actor) resume(pid,PTRACE_CONT,0);
@@ -1743,7 +1834,7 @@ static void birth_terminal_race(int kind,int protected,int code) {
     unsigned long message=1;
     assert(!ptrace(PTRACE_GETEVENTMSG,actor,NULL,&message) && message==(unsigned)code<<8);
     int terminal=0;
-    assert(md_task_birth_read(task_trace,actor,event,SYS_clone,&terminal)==(long)newborn && terminal);
+    assert(md_task_birth_read(task_trace,actor,event,&terminal)==(long)newborn && terminal);
     assert(md_task_birth_terminal(task_trace,actor,SYS_clone,ULONG_MAX)==(long)newborn);
     assert(md_task_stop_displaced(task_trace,actor)==1);
     /* A separate process survives its creator's group death. */
@@ -1832,7 +1923,24 @@ static void terminal_race(int protected,int entry) {
 int main(int argc,char **argv) {
     setvbuf(stdout,NULL,_IOLBF,0);
     alarm(60);
+    md_test_native_probe(argc,argv);
+    int native_skip=argc!=2 || strcmp(argv[1],"--without-syscall-skip");
+    if (!native_skip) {
+        puts("UNAVAILABLE native syscall-skip: inherited policy denies syscall -1; production TRACE/SYSEMU controls remain enabled");
+        argc=1;
+    }
+    if (argc==1 || (argc==2 && !strcmp(argv[1],"--checkpoint-stop"))) {
+        for (int protected=0;protected<2;++protected)
+            for (int restricted=0;restricted<2;++restricted)
+                for (int injection=-3;injection<=-2;++injection)
+                    unified_checkpoint(protected,restricted,0,0,injection);
+        puts("PASS checkpoint group stops: CONT rearms only the consumed interrupt; LISTEN retains native job control");
+        if (argc==2) return 0;
+    }
     if (argc==1 || (argc==2 && !strcmp(argv[1],"--checkpoint-borrow"))) {
+        borrowing_boundaries();
+        for (int protected=0;protected<2;++protected) caller_checkpoint(protected);
+        puts("PASS explicit SYSEMU borrowing: exact native calls, registers and masks under strict seccomp");
         for (int protected=0;protected<2;++protected)
             for (int denied=0;denied<2;++denied)
                 for (int invalid=0;invalid<2;++invalid)
@@ -1870,7 +1978,7 @@ int main(int argc,char **argv) {
     }
     const unsigned scalar_commands[]={MD_BUFFER_MAPPED,MD_BUFFER_TAKE,MD_BUFFER_RELEASE,
         MD_BUFFER_PROC_META,MD_BUFFER_PID_NUMBER,MD_BUFFER_DESCRIPTOR_META,
-        MD_BUFFER_MEMORY_OPEN,MD_BUFFER_MEMORY_OPEN_RESULT,MD_BUFFER_CONTROL_IOCTL_SPEC,
+        MD_BUFFER_MEMORY_OPEN,MD_BUFFER_MEMORY_OPEN_RESULT,
         MD_BUFFER_CONTROL_IOCTL_LAYOUT,MD_BUFFER_PROC_ACK,MD_BUFFER_UTS,MD_BUFFER_SHM_STAT,
         MD_BUFFER_NETWORK_CREDENTIALS,
         MD_FS_BUFFER_CALL,MD_FS_BUFFER_EXEC_PREPARE,MD_FS_BUFFER_EXEC_CANCEL,MD_FS_BUFFER_PROC_LINK,
@@ -1884,12 +1992,15 @@ int main(int argc,char **argv) {
     assert(!md_fs_buffer_scalar(MD_FS_BUFFER_RESULT_REPLAY) && !md_fs_buffer_scalar(MD_BUFFER_FINISH));
     for (unsigned i=0;i<sizeof(scalar_commands)/sizeof(*scalar_commands);++i)
         for (int protected=0;protected<2;++protected)
-            for (int restricted=0;restricted<2;++restricted) scalar_checkpoint(protected,restricted,scalar_commands[i],0);
+            for (int restricted=0;restricted<2;++restricted) scalar_checkpoint(protected,restricted,scalar_commands[i],0,0);
     for (unsigned i=0;i<sizeof(fd_commands)/sizeof(*fd_commands);++i)
         for (int protected=0;protected<2;++protected)
-            for (int restricted=0;restricted<2;++restricted) scalar_checkpoint(protected,restricted,fd_commands[i],1);
+            for (int restricted=0;restricted<2;++restricted) scalar_checkpoint(protected,restricted,fd_commands[i],1,0);
+    for (int protected=0;protected<2;++protected)
+        for (int descriptor=0;descriptor<2;++descriptor)
+            scalar_checkpoint(protected,0,descriptor ? fd_commands[0] : scalar_commands[0],descriptor,1);
     printf("PASS scalar checkpoint: %zu cases; entry-only C return, full-register completion, strict seccomp and blocked SIGTRAP\n",
-        4*(sizeof(scalar_commands)/sizeof(*scalar_commands)+sizeof(fd_commands)/sizeof(*fd_commands)));
+        4+4*(sizeof(scalar_commands)/sizeof(*scalar_commands)+sizeof(fd_commands)/sizeof(*fd_commands)));
     for (int protected=0;protected<2;++protected)
         for (int restricted=0;restricted<2;++restricted)
             for (int denied=0;denied<2;++denied) for (int invalid=0;invalid<2;++invalid)
@@ -1898,19 +2009,25 @@ int main(int argc,char **argv) {
     unsigned cases=0;
     for (int mode=BREAKPOINT;mode<=SYSEMU_CONTEXT;++mode)
         for (unsigned flags=0;flags<16;++flags) {
+            if (mode==SYSCALL && !native_skip) continue;
             run(mode,flags,1); ++cases;
         }
     for (unsigned flags=0;flags<16;++flags) {
         if (flags&BLOCK) continue;
         for (unsigned variant=0;variant<3;++variant) {
-            run(SYSCALL,flags|BLOCK|REPLAY|(variant==1 ? EXHAUSTED : variant==2 ? PENDING : 0),1);
-            ++cases;
+            if (native_skip) {
+                run(SYSCALL,flags|BLOCK|REPLAY|(variant==1 ? EXHAUSTED : variant==2 ? PENDING : 0),1);
+                ++cases;
+            }
             run(SYSCALL,flags|BLOCK|REPLAY|EXTERNAL|DENY_SKIP|(variant==1 ? EXHAUSTED : variant==2 ? PENDING : 0),1);
             ++cases;
         }
     }
     for (int mode=BREAKPOINT;mode<=SYSEMU_CONTEXT;++mode)
-        for (unsigned flags=0;flags<4;++flags) { run(mode,flags|SHARED,1); ++cases; }
+        for (unsigned flags=0;flags<4;++flags) {
+            if (mode==SYSCALL && !native_skip) continue;
+            run(mode,flags|SHARED,1); ++cases;
+        }
     for (unsigned flags=0;flags<8;++flags) {
         run(SYSCALL,flags|FILTER|DENY_SKIP,1);
         run(SECCOMP,flags|DENY_GATE,1);
@@ -1996,6 +2113,7 @@ int main(int argc,char **argv) {
     for (unsigned round=0;round<5;++round)
         for (int i=0;i<6;++i) {
             int mode=(i+round)%6;
+            if (mode==SYSCALL && !native_skip) continue;
             printf("checkpoint round=%u mode=%s 1000_rounds_ms=%.3f\n",round,names[mode],run(mode,0,1000));
         }
     return 0;

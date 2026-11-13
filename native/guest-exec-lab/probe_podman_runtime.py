@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stock Podman/crun in a disposable prepared Linux store under shell UID.
+"""Stock Podman/crun in a prepared Linux store under the selected executor.
 
 The default exercises bridge networking and native overlay. Alternative storage
 and network modes isolate failures; they do not certify the default workflow.
@@ -17,6 +17,10 @@ import shlex
 import signal
 import subprocess
 import sys
+
+
+def network_arguments(network):
+    return [] if network == 'default' else ['--network', network]
 
 
 def guest(options):
@@ -150,7 +154,7 @@ def guest(options):
                 port = external(operation='allocate')['port']
                 ports.append(port)
                 external(operation='handoff', port=port)
-                run(prefix + ['run', '-d', '--name', name, '--log-driver', 'k8s-file', '--network', network, *limits,
+                run(prefix + ['run', '-d', '--name', name, '--log-driver', 'k8s-file', *network_arguments(network), *limits,
                               '-p', f'{host}:{port}:8080/tcp', '-p', f'{host}:{port}:8080/udp',
                               '--mount', 'type=bind,src=' + str(Path(__file__).with_name('docker_network_fixture.py'))
                               + ',dst=/fixture.py,readonly', image, 'python3', '/fixture.py', name, *family])
@@ -163,6 +167,10 @@ def guest(options):
                     run(prefix + ['exec', source, 'python3', '/fixture.py', '--client', target, '8080', target, '20', *family])
                 report['namedPeerExchangePassed'] = True
             outbound = observe(options['observer'], operation='outbound')['url']
+            for name in names:
+                result = run(prefix + ['exec', name, 'python3', '/fixture.py', '--files'])
+                assert 'CONTAINER_FILES_OK' in result['output'], result
+            report['fileOperationsPassed'] = True
             for _ in range(options['execRepeats']):
                 for name in names:
                     run(prefix + ['exec', name, 'python3', '/fixture.py', '--http', outbound])
@@ -180,7 +188,7 @@ def guest(options):
                 report['traceDetachPassed'] = True
                 for source, target in (names, tuple(reversed(names))):
                     run(prefix + ['exec', source, 'python3', '/fixture.py', '--client', target, '8080', target, '20', *family])
-            conflict = run(prefix + ['run', '--rm', '--name', 'md-podman-conflict', '--network', network,
+            conflict = run(prefix + ['run', '--rm', '--name', 'md-podman-conflict', *network_arguments(network),
                                     *limits, '-p', f'{host}:{ports[0]}:8080', image, '/bin/true'], required=False)
             assert conflict.get('exitCode') != 0 and ('already allocated' in conflict['output']
                     or 'address already in use' in conflict['output'].lower()), conflict
@@ -196,6 +204,12 @@ def guest(options):
             report['portFailure'] = repr(error)
             run(['nft', 'list', 'ruleset'], required=False)
             run(['cat', '/etc/resolv.conf'], required=False)
+            if managed_network:
+                run(prefix + ['network', 'inspect', network], required=False)
+                run(prefix + ['inspect', *names], required=False)
+                for name in names:
+                    run(prefix + ['exec', name, 'cat', '/etc/resolv.conf'], required=False)
+                report['networkProcesses'] = process_snapshot()
             raise
         finally:
             try:
@@ -226,7 +240,7 @@ def guest(options):
             run(prefix + ['pull', options['image']], timeout=180)
         created = True
         command = prefix + ['run', '--rm', '--name', name, '--log-driver', 'k8s-file',
-                            '--network', options['network'], *limits, options['image'],
+                            *network_arguments(options['network']), *limits, options['image'],
                             '/bin/sh', '-ec', 'id; echo PODMAN_CONTAINER_OK']
         result = run(command)
         assert 'PODMAN_CONTAINER_OK' in result['output'].splitlines(), result
@@ -234,7 +248,7 @@ def guest(options):
             exercise_ports()
         if options['network'] != 'none' and options['internet']:
             result = run(prefix + ['run', '--rm', '--name', name, '--log-driver', 'k8s-file',
-                          '--network', options['network'], *limits, options['image'], '/bin/sh', '-ec',
+                          *network_arguments(options['network']), *limits, options['image'], '/bin/sh', '-ec',
                           'wget -T 15 -qO /tmp/page http://example.com; test -s /tmp/page; echo PODMAN_INTERNET_OK'])
             assert 'PODMAN_INTERNET_OK' in result['output'].splitlines(), result
         if options['observer'] and options['internet']:
@@ -262,14 +276,15 @@ def guest(options):
 
 def main():
     from test_oci_services import Suite, add_machine_entry_argument
+    from fixture_executor import FixtureExecutor
     from kernel_profile import KernelProfile
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('build', type=Path)
     parser.add_argument('store')
     parser.add_argument('--storage', choices=('overlay', 'vfs'), default='overlay')
-    parser.add_argument('--network', choices=('bridge', 'slirp4netns', 'host', 'none'),
-                        help='Default: bridge, or slirp4netns with --rootless-user')
-    parser.add_argument('--rootless-user', help='Existing disposable guest user with subuid/subgid ranges and stock uidmap/slirp4netns')
+    parser.add_argument('--network', choices=('default', 'bridge', 'pasta', 'slirp4netns', 'host', 'none'),
+                        help='Default: bridge, or the installed Podman default with --rootless-user')
+    parser.add_argument('--rootless-user', help='Existing disposable guest user with subuid/subgid ranges and stock uidmap/network helpers')
     parser.add_argument('--cgroups', choices=('enabled', 'disabled'), default='enabled',
                         help='Explicit diagnostic mode; disabled does not certify cgroup support')
     parser.add_argument('--image', default='docker.io/library/alpine:3.23')
@@ -291,11 +306,12 @@ def main():
     parser.add_argument('--host-limits', action='store_true', help='Set nofile/nproc explicitly to inherited shell limits')
     parser.add_argument('--unlimited-pids', action='store_true', help='Explicitly disable the optional pids-controller limit')
     add_machine_entry_argument(parser)
+    FixtureExecutor.add_argument(parser)
     KernelProfile.add_argument(parser)
     args = parser.parse_args()
-    args.network = args.network or ('slirp4netns' if args.rootless_user else 'bridge')
-    if args.exercise_ports and args.network not in ('bridge', 'slirp4netns'):
-        parser.error('--exercise-ports requires bridge or slirp4netns')
+    args.network = args.network or ('default' if args.rootless_user else 'bridge')
+    if args.exercise_ports and args.network not in ('default', 'bridge', 'pasta', 'slirp4netns'):
+        parser.error('--exercise-ports requires default, bridge, pasta or slirp4netns')
     if args.ipv6 and args.network != 'bridge':
         parser.error('--ipv6 currently exercises the bridge network')
     if args.trace and args.rootless_user:
@@ -307,7 +323,7 @@ def main():
     if not 1 <= args.exec_repeats <= 50:
         parser.error('--exec-repeats must be between 1 and 50')
     suite = Suite(Path('build/podman-results'), args.build, machine_entry=args.machine_entry,
-                  kernel_profile=args.kernel_profile)
+                  kernel_profile=args.kernel_profile, executor=args.executor)
     from docker_network_fixture import Observer
     observer = Observer(args.ipv6_host) if args.exercise_ports else None
     target = '/tmp/md-podman-probe-' + suite.report['id']
@@ -316,13 +332,13 @@ def main():
         runner += ['--diagnostics']
     created = False
     try:
-        suite.transport.upload(suite.client, Path(__file__), suite.base + '/probe.py')
-        suite.transport.upload(suite.client, Path(__file__).with_name('docker_network_fixture.py'),
+        suite.upload(Path(__file__), suite.base + '/probe.py')
+        suite.upload(Path(__file__).with_name('docker_network_fixture.py'),
                                suite.base + '/docker_network_fixture.py')
         if args.capture_nft:
-            suite.transport.upload(suite.client, Path(__file__).with_name('fixtures') / 'nft-capture.py',
+            suite.upload(Path(__file__).with_name('fixtures') / 'nft-capture.py',
                                    suite.base + '/nft')
-            suite.command(['chmod', '755', suite.base + '/nft'])
+            suite.chmod('755', suite.base + '/nft')
         suite.command(runner + ['--', '/bin/mkdir', target]); created = True
         options = {'directory': '/tmp/md-podman-' + suite.report['id'],
                    # Podman 4 limits runroot (including "-run") to 50 bytes.
@@ -346,7 +362,7 @@ def main():
             suite.command(['/system/bin/sh', '-c', shlex.join(command) + ' >' +
                            shlex.quote(remote_log) + ' 2>&1'], timeout=deadline+20)
         finally:
-            suite.transport.download(suite.client, remote_log, local_log, overwrite=True)
+            suite.download(remote_log, local_log, overwrite=True)
             output = local_log.read_text(errors='replace')
             suite.record_entry(output)
             suite.kernel_profile.observe(output, required=True)
@@ -355,6 +371,9 @@ def main():
         assert len(reports) == 1, output[-2000:]
         report = json.loads(reports[0]); suite.report['podman'] = report
         assert report['passed'], report.get('failure', 'container cleanup failed')
+        if args.machine_entry and args.exercise_ports:
+            assert any(row.get('filteredCompleted', 0) for row in suite.report['machineEntry']['processes']), \
+                'No post-filter lazy completions in container workload'
         suite.report['passed'] = True
     finally:
         if observer:

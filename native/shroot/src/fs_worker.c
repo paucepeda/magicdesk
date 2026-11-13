@@ -11,6 +11,7 @@
 #include "ofd_order.h"
 #include "input_session.h"
 #include "device_events.h"
+#include "pty_events.h"
 #include "device_tree.h"
 #include "network_resolver.h"
 #include "fs_continuation.h"
@@ -221,6 +222,7 @@ static void runtime_close(struct worker_runtime *runtime) {
     md_provider_tree_release(runtime->devices);
     md_control_file_release(fs->render_device);
     md_device_events_stop(fs->device_events);
+    md_pty_events_release(fs->pty_events);
     md_fs_mounts_close(fs);
     md_fs_storage_close(&runtime->storage);
     md_ipc_credentials_close(fs->ipc);
@@ -401,12 +403,13 @@ void md_fs_worker_notifications(struct md_fs_worker *w, int fd, void *context,
     w->prepare_wait=prepare;
     pthread_mutex_unlock(&w->lock); md_queue_signal_send(&w->wake);
 }
+void md_fs_worker_notify(struct md_fs_worker *w) { md_queue_signal_send(&w->done); }
 void md_fs_worker_publish(struct md_fs_worker *w, struct md_fs_work *work) {
     work->next = NULL;
     work->published_at=md_cost_begin(w->statistics ? &w->delivery : NULL);
     pthread_mutex_lock(&w->lock);
     *w->completed_tail = work; w->completed_tail = &work->next;
-    pthread_mutex_unlock(&w->lock); md_queue_signal_send(&w->done);
+    pthread_mutex_unlock(&w->lock); md_fs_worker_notify(w);
 }
 int md_fs_worker_submit(struct md_fs_worker *w, struct md_fs_work *work) {
     if (!w || !work || !work->run || !work->complete) return -EINVAL;
@@ -443,7 +446,12 @@ int md_fs_worker_dispatch(struct md_fs_worker *w) {
         if (w->statistics) md_cost_end(&w->completion,start);
         if (!error) error=result;
     }
-    return error ? error : md_fs_worker_error(w);
+    if (error) fprintf(stderr,"Shroot: filesystem completion failed: %s (%d)\n",strerror(-error),error);
+    else {
+        error=md_fs_worker_error(w);
+        if (error) fprintf(stderr,"Shroot: filesystem service failed: %s (%d)\n",strerror(-error),error);
+    }
+    return error;
 }
 int md_fs_worker_stop(struct md_fs_worker *w) {
     if (!w) return 0;

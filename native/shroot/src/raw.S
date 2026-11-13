@@ -28,6 +28,22 @@ md_raw_return:
     ret
 .size md_raw, .-md_raw
 
+.global md_guest_native_call_kernel
+.type md_guest_native_call_kernel, %function
+md_guest_native_call_kernel:
+    mov x8, x0
+    mov x0, x1
+    mov x1, x2
+    mov x2, x3
+    mov x3, x4
+    mov x4, x5
+    mov x5, x6
+    svc #0
+.global md_guest_native_return
+md_guest_native_return:
+    ret
+.size md_guest_native_call_kernel, .-md_guest_native_call_kernel
+
 .global md_enter
 .type md_enter, %function
 md_enter:
